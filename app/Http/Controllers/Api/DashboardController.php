@@ -15,10 +15,23 @@ class DashboardController extends Controller
         $isTeacher = $user->role === 'teacher';
         $students = DB::table('students')->when($isTeacher, fn ($query) => $query->where('teacher_id', $user->id));
         $studentIds = (clone $students)->select('id');
-        $levelCount = fn (string $profile) => (clone $students)->where('reading_profile', $profile)->count();
+        $studentMetrics = (clone $students)
+            ->selectRaw('COUNT(*) as students')
+            ->selectRaw("COALESCE(SUM(CASE WHEN reading_profile = 'Independent' THEN 1 ELSE 0 END), 0) as independent")
+            ->selectRaw("COALESCE(SUM(CASE WHEN reading_profile = 'Instructional' THEN 1 ELSE 0 END), 0) as instructional")
+            ->selectRaw("COALESCE(SUM(CASE WHEN reading_profile = 'Frustration' THEN 1 ELSE 0 END), 0) as frustration")
+            ->first();
         $presentQuery = DB::table('remedial_attendance')->when($isTeacher, fn ($query) => $query->join('remedial_sessions', 'remedial_sessions.id', '=', 'remedial_attendance.session_id')->where('remedial_sessions.teacher_id', $user->id));
-        $present = (clone $presentQuery)->where('remedial_attendance.status', 'Present')->count();
-        $absent = (clone $presentQuery)->where('remedial_attendance.status', 'Absent')->count();
+        $attendanceSummary = (clone $presentQuery)
+            ->selectRaw("COALESCE(SUM(CASE WHEN remedial_attendance.status = 'Present' THEN 1 ELSE 0 END), 0) as present")
+            ->selectRaw("COALESCE(SUM(CASE WHEN remedial_attendance.status = 'Absent' THEN 1 ELSE 0 END), 0) as absent")
+            ->first();
+        $present = (int) $attendanceSummary->present;
+        $absent = (int) $attendanceSummary->absent;
+        $studentCount = (int) $studentMetrics->students;
+        $independentCount = (int) $studentMetrics->independent;
+        $instructionalCount = (int) $studentMetrics->instructional;
+        $frustrationCount = (int) $studentMetrics->frustration;
         $gradeDistribution = (clone $students)->select('grade_level')
             ->selectRaw("SUM(CASE WHEN reading_profile = 'Independent' THEN 1 ELSE 0 END) as independent")
             ->selectRaw("SUM(CASE WHEN reading_profile = 'Instructional' THEN 1 ELSE 0 END) as instructional")
@@ -45,16 +58,16 @@ class DashboardController extends Controller
         return response()->json([
             'role' => $user->role,
             'metrics' => [
-                'students' => (clone $students)->count(),
+                'students' => $studentCount,
                 'teachers' => $isTeacher ? 0 : DB::table('users')->where('role', 'teacher')->where('status', 'active')->count(),
                 'assessments' => DB::table('assessments')->whereIn('student_id', $studentIds)->count(),
                 'pending_endorsements' => DB::table('endorsements')
                     ->when($isTeacher, fn ($query) => $query->where('teacher_id', $user->id))
                     ->where('status', 'Pending')->count(),
                 'remedial_sessions' => DB::table('remedial_sessions')->whereIn('student_id', $studentIds)->count(),
-                'independent' => $levelCount('Independent'),
-                'instructional' => $levelCount('Instructional'),
-                'frustration' => $levelCount('Frustration'),
+                'independent' => $independentCount,
+                'instructional' => $instructionalCount,
+                'frustration' => $frustrationCount,
                 'remedial_pupils' => DB::table('remedial_sessions')->whereIn('student_id', $studentIds)->whereIn('status', ['Scheduled', 'In Progress'])->distinct('student_id')->count('student_id'),
                 'present_attendance' => $present,
                 'absent_attendance' => $absent,
@@ -71,9 +84,9 @@ class DashboardController extends Controller
                 ->get(['students.id', 'students.full_name', 'students.grade_level', 'students.reading_profile', 'latest_assessments.latest_assessment as last_assessment']),
             'student_overview' => $studentOverview,
             'level_distribution' => [
-                'independent' => $levelCount('Independent'),
-                'instructional' => $levelCount('Instructional'),
-                'frustration' => $levelCount('Frustration'),
+                'independent' => $independentCount,
+                'instructional' => $instructionalCount,
+                'frustration' => $frustrationCount,
             ],
             'grade_distribution' => $gradeDistribution,
             'recent_progress' => $recentProgress,
