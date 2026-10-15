@@ -15,12 +15,37 @@ class DashboardController extends Controller
         $isTeacher = $user->role === 'teacher';
         $students = DB::table('students')->when($isTeacher, fn ($query) => $query->where('teacher_id', $user->id));
         $studentIds = (clone $students)->select('id');
-        $studentMetrics = (clone $students)
+        $studentMetricsQuery = (clone $students)
             ->selectRaw('COUNT(*) as students')
             ->selectRaw("COALESCE(SUM(CASE WHEN reading_profile = 'Independent' THEN 1 ELSE 0 END), 0) as independent")
             ->selectRaw("COALESCE(SUM(CASE WHEN reading_profile = 'Instructional' THEN 1 ELSE 0 END), 0) as instructional")
             ->selectRaw("COALESCE(SUM(CASE WHEN reading_profile = 'Frustration' THEN 1 ELSE 0 END), 0) as frustration")
-            ->first();
+            ->selectSub(
+                DB::table('assessments')->whereIn('student_id', $studentIds)->selectRaw('COUNT(*)'),
+                'assessments'
+            )
+            ->selectSub(
+                DB::table('endorsements')
+                    ->when($isTeacher, fn ($query) => $query->where('teacher_id', $user->id))
+                    ->where('status', 'Pending')->selectRaw('COUNT(*)'),
+                'pending_endorsements'
+            )
+            ->selectSub(
+                DB::table('remedial_sessions')->whereIn('student_id', $studentIds)->selectRaw('COUNT(*)'),
+                'remedial_sessions'
+            )
+            ->selectSub(
+                DB::table('remedial_sessions')->whereIn('student_id', $studentIds)
+                    ->whereIn('status', ['Scheduled', 'In Progress'])->selectRaw('COUNT(DISTINCT student_id)'),
+                'remedial_pupils'
+            );
+        if (!$isTeacher) {
+            $studentMetricsQuery->selectSub(
+                DB::table('users')->where('role', 'teacher')->where('status', 'active')->selectRaw('COUNT(*)'),
+                'teachers'
+            );
+        }
+        $studentMetrics = $studentMetricsQuery->first();
         $presentQuery = DB::table('remedial_attendance')->when($isTeacher, fn ($query) => $query->join('remedial_sessions', 'remedial_sessions.id', '=', 'remedial_attendance.session_id')->where('remedial_sessions.teacher_id', $user->id));
         $attendanceSummary = (clone $presentQuery)
             ->selectRaw("COALESCE(SUM(CASE WHEN remedial_attendance.status = 'Present' THEN 1 ELSE 0 END), 0) as present")
@@ -59,16 +84,14 @@ class DashboardController extends Controller
             'role' => $user->role,
             'metrics' => [
                 'students' => $studentCount,
-                'teachers' => $isTeacher ? 0 : DB::table('users')->where('role', 'teacher')->where('status', 'active')->count(),
-                'assessments' => DB::table('assessments')->whereIn('student_id', $studentIds)->count(),
-                'pending_endorsements' => DB::table('endorsements')
-                    ->when($isTeacher, fn ($query) => $query->where('teacher_id', $user->id))
-                    ->where('status', 'Pending')->count(),
-                'remedial_sessions' => DB::table('remedial_sessions')->whereIn('student_id', $studentIds)->count(),
+                'teachers' => $isTeacher ? 0 : (int) $studentMetrics->teachers,
+                'assessments' => (int) $studentMetrics->assessments,
+                'pending_endorsements' => (int) $studentMetrics->pending_endorsements,
+                'remedial_sessions' => (int) $studentMetrics->remedial_sessions,
                 'independent' => $independentCount,
                 'instructional' => $instructionalCount,
                 'frustration' => $frustrationCount,
-                'remedial_pupils' => DB::table('remedial_sessions')->whereIn('student_id', $studentIds)->whereIn('status', ['Scheduled', 'In Progress'])->distinct('student_id')->count('student_id'),
+                'remedial_pupils' => (int) $studentMetrics->remedial_pupils,
                 'present_attendance' => $present,
                 'absent_attendance' => $absent,
                 'attendance_rate' => ($present + $absent) > 0 ? (int) round($present / ($present + $absent) * 100) : 0,
