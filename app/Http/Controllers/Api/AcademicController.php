@@ -125,8 +125,18 @@ class AcademicController extends Controller
     {
         $query = DB::table('schedule_events')->leftJoin('users', 'users.id', '=', 'schedule_events.teacher_id');
         if ($request->user()->role === 'teacher') $query->where('schedule_events.teacher_id', $request->user()->id);
-        return response()->json(['data' => $query->orderBy('event_date')->orderBy('start_time')
-            ->get(['schedule_events.*', 'users.full_name as teacher_name'])]);
+        $range = $request->validate([
+            'from' => ['required_with:to', 'date'],
+            'to' => ['required_with:from', 'date', 'after_or_equal:from'],
+        ]);
+        if (isset($range['from'], $range['to'])) {
+            $query->whereBetween('schedule_events.event_date', [$range['from'], $range['to']]);
+        }
+        $columns = isset($range['from'], $range['to'])
+            ? ['schedule_events.id', 'schedule_events.title', 'schedule_events.event_type', 'schedule_events.grade_level', 'schedule_events.section', 'schedule_events.event_date', 'schedule_events.start_time', 'schedule_events.end_time', 'users.full_name as teacher_name']
+            : ['schedule_events.*', 'users.full_name as teacher_name'];
+
+        return response()->json(['data' => $query->orderBy('event_date')->orderBy('start_time')->get($columns)]);
     }
 
     public function addSchedule(Request $request): JsonResponse

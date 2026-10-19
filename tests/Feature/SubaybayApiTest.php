@@ -94,6 +94,36 @@ class SubaybayApiTest extends TestCase
             ->assertJsonPath('data.0.tool', 'Phil-IRI');
     }
 
+    public function test_schedule_can_fetch_only_the_visible_week_with_teacher_scope(): void
+    {
+        $teacher = $this->user();
+        $other = $this->user('teacher', 'active', 2);
+        $visibleId = \Illuminate\Support\Facades\DB::table('schedule_events')->insertGetId([
+            'title' => 'Visible session', 'event_date' => '2026-09-02', 'start_time' => '09:00:00', 'teacher_id' => $teacher->id,
+        ]);
+        \Illuminate\Support\Facades\DB::table('schedule_events')->insert([
+            ['title' => 'Future session', 'event_date' => '2026-09-09', 'start_time' => '09:00:00', 'teacher_id' => $teacher->id],
+            ['title' => 'Other teacher session', 'event_date' => '2026-09-03', 'start_time' => '09:00:00', 'teacher_id' => $other->id],
+        ]);
+
+        $this->actingAs($teacher, 'sanctum')->getJson('/api/schedule?from=2026-09-01&to=2026-09-05')
+            ->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('data.0.id', $visibleId)
+            ->assertJsonMissingPath('data.0.description');
+    }
+
+    public function test_material_detail_loads_one_record_instead_of_the_full_listing(): void
+    {
+        $teacher = $this->user();
+        $materialId = \Illuminate\Support\Facades\DB::table('learning_materials')->insertGetId([
+            'title' => 'Single material', 'material_type' => 'Reading Passage', 'grade_level' => 'Grade 2',
+            'description' => 'Material details', 'uploaded_by' => $teacher->id,
+        ]);
+
+        $this->actingAs($teacher, 'sanctum')->getJson('/api/materials/'.$materialId)
+            ->assertOk()->assertJsonPath('data.id', $materialId)->assertJsonPath('data.title', 'Single material')
+            ->assertJsonPath('data.uploader_name', $teacher->full_name);
+    }
+
     public function test_dashboard_returns_the_original_monitoring_summaries(): void
     {
         $teacher = $this->user();

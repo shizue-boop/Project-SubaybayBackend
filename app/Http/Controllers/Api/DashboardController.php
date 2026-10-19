@@ -65,11 +65,11 @@ class DashboardController extends Controller
         $recentProgress = DB::table('progress_updates')->join('students', 'students.id', '=', 'progress_updates.student_id')
             ->leftJoin('users', 'users.id', '=', 'progress_updates.updated_by')->whereIn('students.id', $studentIds)
             ->orderByDesc('progress_updates.update_date')->limit(6)
-            ->get(['progress_updates.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as updated_by_name']);
+            ->get(['progress_updates.id', 'progress_updates.previous_profile', 'progress_updates.current_profile', 'progress_updates.trend', 'progress_updates.update_date', 'students.full_name', 'students.grade_level', 'students.section']);
         $upcomingSessions = DB::table('remedial_sessions')->join('students', 'students.id', '=', 'remedial_sessions.student_id')
             ->whereIn('students.id', $studentIds)->where('session_date', '>=', now()->toDateString())
             ->orderBy('session_date')->orderBy('start_time')->limit(5)
-            ->get(['remedial_sessions.*', 'students.full_name', 'students.grade_level', 'students.section']);
+            ->get(['remedial_sessions.id', 'remedial_sessions.session_date', 'remedial_sessions.start_time', 'remedial_sessions.session_type', 'remedial_sessions.status', 'students.full_name', 'students.grade_level', 'students.section']);
         $materialHistory = DB::table('material_distribution')->join('learning_materials', 'learning_materials.id', '=', 'material_distribution.material_id')
             ->leftJoin('students', 'students.full_name', '=', 'material_distribution.given_to')
             ->leftJoin('users', 'users.id', '=', 'material_distribution.given_by')

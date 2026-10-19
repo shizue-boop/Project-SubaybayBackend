@@ -44,6 +44,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/endorsements/{endorsement}/review', [EndorsementController::class, 'review']);
     Route::get('/endorsements/{endorsement}/history', [EndorsementController::class, 'history']);
     Route::get('/materials', [MaterialController::class, 'index']);
+    Route::get('/materials/{material}', [MaterialController::class, 'show']);
     Route::post('/materials', [MaterialController::class, 'upload']);
     Route::put('/materials/{material}', [MaterialController::class, 'update']);
     Route::delete('/materials/{material}', [MaterialController::class, 'destroy']);

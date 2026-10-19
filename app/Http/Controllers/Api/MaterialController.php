@@ -31,6 +31,16 @@ class MaterialController extends Controller
         return response()->json($payload);
     }
 
+    public function show(Request $request, int $material): JsonResponse
+    {
+        $record = DB::table('learning_materials')->leftJoin('users', 'users.id', '=', 'learning_materials.uploaded_by')
+            ->where('learning_materials.id', $material)
+            ->first(['learning_materials.*', 'users.full_name as uploader_name']);
+        abort_unless($record, 404);
+
+        return response()->json(['data' => $record]);
+    }
+
     public function upload(Request $request): JsonResponse
     {
         abort_unless(in_array($request->user()->role, ['principal', 'coordinator'], true), 403);
