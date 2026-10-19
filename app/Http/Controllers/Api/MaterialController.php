@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Controllers\Api\Concerns\PaginatesApiResults;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -10,11 +11,24 @@ use Illuminate\Support\Facades\Storage;
 
 class MaterialController extends Controller
 {
-    public function index(): JsonResponse
+    use PaginatesApiResults;
+
+    public function index(Request $request): JsonResponse
     {
-        $data = DB::table('learning_materials')->leftJoin('users', 'users.id', '=', 'learning_materials.uploaded_by')
-            ->orderByDesc('upload_date')->get(['learning_materials.*', 'users.full_name as uploader_name']);
-        return response()->json(['data' => $data]);
+        $query = DB::table('learning_materials')->leftJoin('users', 'users.id', '=', 'learning_materials.uploaded_by');
+        if ($search = trim(mb_substr((string) $request->query('search', ''), 0, 100))) {
+            $query->where(fn ($q) => $q->where('learning_materials.title', 'like', '%'.$search.'%')->orWhere('learning_materials.material_type', 'like', '%'.$search.'%')->orWhere('learning_materials.skill_focus', 'like', '%'.$search.'%')->orWhere('learning_materials.description', 'like', '%'.$search.'%'));
+        }
+        foreach (['grade' => 'grade_level', 'language' => 'language', 'part' => 'alignment_part', 'profile' => 'reading_level'] as $parameter => $column) {
+            $value = trim((string) $request->query($parameter, ''));
+            if ($value !== '' && !in_array($value, ['All Grades', 'All Profiles'], true)) $query->where('learning_materials.'.$column, $value);
+        }
+        $query->orderByDesc('upload_date')->orderByDesc('learning_materials.id');
+        $columns = ['learning_materials.*', 'users.full_name as uploader_name'];
+        $page = $this->paginateApiQuery($request, $query, $columns);
+        $payload = $page ?? ['data' => $query->get($columns)];
+        $payload['languages'] = DB::table('learning_materials')->whereNotNull('language')->distinct()->orderBy('language')->pluck('language');
+        return response()->json($payload);
     }
 
     public function upload(Request $request): JsonResponse

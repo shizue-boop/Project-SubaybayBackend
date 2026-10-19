@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Controllers\Api\Concerns\PaginatesApiResults;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -10,13 +11,20 @@ use Illuminate\Validation\Rule;
 
 class AcademicController extends Controller
 {
+    use PaginatesApiResults;
+
     public function assessments(Request $request): JsonResponse
     {
         $query = DB::table('assessments')->join('students', 'students.id', '=', 'assessments.student_id')
             ->leftJoin('users', 'users.id', '=', 'assessments.recorded_by');
         if ($request->user()->role === 'teacher') $query->where('students.teacher_id', $request->user()->id);
-        return response()->json(['data' => $query->orderByDesc('assessment_date')->orderByDesc('assessments.id')
-            ->get(['assessments.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as recorded_by_name'])]);
+        if ($search = trim(mb_substr((string) $request->query('search', ''), 0, 100))) {
+            $query->where(fn ($q) => $q->where('students.full_name', 'like', '%'.$search.'%')->orWhere('students.grade_level', 'like', '%'.$search.'%')->orWhere('assessments.tool', 'like', '%'.$search.'%')->orWhere('assessments.profile', 'like', '%'.$search.'%'));
+        }
+        $query->orderByDesc('assessment_date')->orderByDesc('assessments.id');
+        $columns = ['assessments.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as recorded_by_name'];
+        $page = $this->paginateApiQuery($request, $query, $columns);
+        return response()->json($page ?? ['data' => $query->get($columns)]);
     }
 
     public function recordAssessment(Request $request): JsonResponse
@@ -50,8 +58,13 @@ class AcademicController extends Controller
         $query = DB::table('progress_updates')->join('students', 'students.id', '=', 'progress_updates.student_id')
             ->leftJoin('users', 'users.id', '=', 'progress_updates.updated_by');
         if ($request->user()->role === 'teacher') $query->where('students.teacher_id', $request->user()->id);
-        return response()->json(['data' => $query->orderByDesc('update_date')
-            ->get(['progress_updates.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as updated_by_name'])]);
+        if ($search = trim(mb_substr((string) $request->query('search', ''), 0, 100))) {
+            $query->where(fn ($q) => $q->where('students.full_name', 'like', '%'.$search.'%')->orWhere('students.grade_level', 'like', '%'.$search.'%')->orWhere('progress_updates.current_profile', 'like', '%'.$search.'%')->orWhere('progress_updates.trend', 'like', '%'.$search.'%'));
+        }
+        $query->orderByDesc('update_date')->orderByDesc('progress_updates.id');
+        $columns = ['progress_updates.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as updated_by_name'];
+        $page = $this->paginateApiQuery($request, $query, $columns);
+        return response()->json($page ?? ['data' => $query->get($columns)]);
     }
 
     public function addProgress(Request $request): JsonResponse

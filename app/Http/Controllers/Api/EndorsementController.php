@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Controllers\Api\Concerns\PaginatesApiResults;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -10,6 +11,8 @@ use Illuminate\Support\Facades\Storage;
 
 class EndorsementController extends Controller
 {
+    use PaginatesApiResults;
+
     public function show(Request $request, int $endorsement): JsonResponse
     {
         $reviewer = in_array($request->user()->role, ['principal', 'coordinator'], true);
@@ -46,12 +49,17 @@ class EndorsementController extends Controller
             ->when($request->query('status') && $request->query('status') !== 'All', fn ($q) => $q->where('endorsements.status', $request->query('status')))
             ->orderByRaw("FIELD(endorsements.status, 'Pending', 'Returned for Revision', 'Approved', 'Rejected')")
             ->orderByDesc('endorsements.created_at');
-        $data = $query->get(['endorsements.*', 'students.full_name', 'students.grade_level', 'students.section', 'teachers.full_name as teacher_name']);
+        if ($search = trim(mb_substr((string) $request->query('search', ''), 0, 100))) {
+            $query->where(fn ($q) => $q->where('students.full_name', 'like', '%'.$search.'%')->orWhere('students.grade_level', 'like', '%'.$search.'%')->orWhere('teachers.full_name', 'like', '%'.$search.'%')->orWhere('endorsements.assessment_tool', 'like', '%'.$search.'%')->orWhere('endorsements.reading_level', 'like', '%'.$search.'%'));
+        }
+        $columns = ['endorsements.*', 'students.full_name', 'students.grade_level', 'students.section', 'teachers.full_name as teacher_name'];
+        $page = $this->paginateApiQuery($request, $query, $columns);
+        $data = $page['data'] ?? $query->get($columns);
         $counts = DB::table('endorsements')->when(!$reviewer, fn ($q) => $q->where('teacher_id', $user->id))
             ->select('status', DB::raw('COUNT(*) as total'))->groupBy('status')->pluck('total', 'status');
         $counts = ['All' => $counts->sum(), 'Pending' => (int) ($counts['Pending'] ?? 0), 'Approved' => (int) ($counts['Approved'] ?? 0), 'Returned for Revision' => (int) ($counts['Returned for Revision'] ?? 0), 'Rejected' => (int) ($counts['Rejected'] ?? 0)];
         $students = $reviewer ? [] : DB::table('students')->where('teacher_id', $user->id)->orderBy('full_name')->get(['id', 'full_name', 'grade_level', 'section']);
-        return response()->json(['data' => $data, 'counts' => $counts, 'students' => $students, 'reviewer' => $reviewer]);
+        return response()->json(array_merge(['data' => $data, 'counts' => $counts, 'students' => $students, 'reviewer' => $reviewer], $page ? ['pagination' => $page['pagination']] : []));
     }
 
     public function submit(Request $request): JsonResponse

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Controllers\Api\Concerns\PaginatesApiResults;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -12,6 +13,8 @@ use Illuminate\Validation\Rule;
 
 class AccountController extends Controller
 {
+    use PaginatesApiResults;
+
     public function profile(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -74,12 +77,17 @@ class AccountController extends Controller
         $studentCounts = DB::table('students')
             ->select('teacher_id', DB::raw('COUNT(*) as student_count'))
             ->groupBy('teacher_id');
-        $teachers = DB::table('users')->leftJoinSub($studentCounts, 'student_counts', function ($join) {
+        $query = DB::table('users')->leftJoinSub($studentCounts, 'student_counts', function ($join) {
             $join->on('users.id', '=', 'student_counts.teacher_id');
-        })->where('users.role', 'teacher')->orderByDesc('users.joined_date')
-            ->get(['users.id', 'users.full_name', 'users.email', 'users.section', 'users.grade_level', 'users.status', 'users.joined_date', DB::raw('COALESCE(student_counts.student_count, 0) as student_count')]);
+        })->where('users.role', 'teacher')->orderByDesc('users.joined_date')->orderByDesc('users.id');
+        if ($search = trim(mb_substr((string) $request->query('search', ''), 0, 100))) {
+            $query->where(fn ($q) => $q->where('users.full_name', 'like', '%'.$search.'%')->orWhere('users.email', 'like', '%'.$search.'%')->orWhere('users.section', 'like', '%'.$search.'%')->orWhere('users.grade_level', 'like', '%'.$search.'%'));
+        }
+        $teacherColumns = ['users.id', 'users.full_name', 'users.email', 'users.section', 'users.grade_level', 'users.status', 'users.joined_date', DB::raw('COALESCE(student_counts.student_count, 0) as student_count')];
+        $page = $this->paginateApiQuery($request, $query, $teacherColumns);
+        $teachers = $page['data'] ?? $query->get($teacherColumns);
         $principal = DB::table('users')->where('role', 'principal')->orderBy('id')->first(['id', 'full_name', 'email', 'status', 'joined_date']);
-        return response()->json(['teachers' => $teachers, 'principal' => $principal]);
+        return response()->json(array_merge(['teachers' => $teachers, 'principal' => $principal], $page ? ['pagination' => $page['pagination']] : []));
     }
 
     public function teacherProfile(Request $request, int $teacher): JsonResponse

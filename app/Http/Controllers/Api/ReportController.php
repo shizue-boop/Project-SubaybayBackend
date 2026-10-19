@@ -3,26 +3,35 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Controllers\Api\Concerns\PaginatesApiResults;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 
 class ReportController extends Controller
 {
+    use PaginatesApiResults;
+
     public function index(Request $request): JsonResponse
     {
         $user = $request->user();
         $isTeacher = $user->role === 'teacher';
-        $reports = DB::table('reports')->leftJoin('users', 'users.id', '=', 'reports.generated_by')
+        $query = DB::table('reports')->leftJoin('users', 'users.id', '=', 'reports.generated_by')
             ->when($isTeacher, fn ($query) => $query->where('reports.generated_by', $user->id))
-            ->orderByDesc('created_at')->get(['reports.*', 'users.full_name as generator_name']);
-        $studentFilter = fn ($query) => $query->when($isTeacher, fn ($q) => $q->where('teacher_id', $user->id));
+            ->orderByDesc('created_at')->orderByDesc('reports.id');
+        if ($search = trim(mb_substr((string) $request->query('search', ''), 0, 100))) {
+            $query->where(fn ($q) => $q->where('reports.report_title', 'like', '%'.$search.'%')->orWhere('reports.report_type', 'like', '%'.$search.'%')->orWhere('reports.status', 'like', '%'.$search.'%'));
+        }
+        $totalReports = (clone $query)->count('reports.id');
+        $page = $this->paginateApiQuery($request, $query, ['reports.*', 'users.full_name as generator_name']);
+        $reports = $page['data'] ?? $query->get(['reports.*', 'users.full_name as generator_name']);
         $avgQuery = DB::table('students')->where('score', '>', 0);
         if ($isTeacher) $avgQuery->where('teacher_id', $user->id);
         $totalAssessedQuery = DB::table('assessments')->join('students', 'students.id', '=', 'assessments.student_id');
         if ($isTeacher) $totalAssessedQuery->where('students.teacher_id', $user->id);
-        return response()->json(['data' => $reports, 'total_reports' => $reports->count(), 'average_score' => (float) ($avgQuery->avg('score') ?? 0), 'total_assessed' => $totalAssessedQuery->count()]);
+        return response()->json(array_merge(['data' => $reports, 'total_reports' => $totalReports, 'average_score' => (float) ($avgQuery->avg('score') ?? 0), 'total_assessed' => $totalAssessedQuery->count()], $page ? ['pagination' => $page['pagination']] : []));
     }
 
     public function generate(Request $request): JsonResponse
@@ -55,7 +64,12 @@ class ReportController extends Controller
                 ['Materials distributed', 'material_distribution', 'date_given', 'given_by'],
             ];
             foreach ($activityDefinitions as [$label, $table, $dateColumn, $ownerColumn]) {
-                $query = DB::table($table)->whereBetween(DB::raw($table === 'endorsements' ? 'DATE(created_at)' : $dateColumn), [$start, $end]);
+                $query = DB::table($table);
+                if ($table === 'endorsements') {
+                    $query->where('created_at', '>=', $start)->where('created_at', '<', Carbon::parse($end)->addDay()->toDateString());
+                } else {
+                    $query->whereBetween($dateColumn, [$start, $end]);
+                }
                 if ($teacher) $query->where($ownerColumn, $user->id);
                 $reportRows[] = [$label, (int) $query->count()];
             }

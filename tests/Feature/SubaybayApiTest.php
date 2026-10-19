@@ -54,7 +54,44 @@ class SubaybayApiTest extends TestCase
         \Illuminate\Support\Facades\DB::table('students')->insert(['lrn' => 'L-2', 'full_name' => 'Other Pupil', 'section' => 'Rizal', 'grade_level' => 'Grade 2', 'teacher_id' => $other->id, 'score' => 20]);
 
         $this->actingAs($teacher, 'sanctum')->getJson('/api/students')->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('data.0.id', $ownedId);
+        $this->actingAs($teacher, 'sanctum')->getJson('/api/students?options=1')->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('data.0.id', $ownedId)->assertJsonMissingPath('data.0.lrn');
         $this->actingAs($teacher, 'sanctum')->postJson('/api/students', ['full_name' => 'Unauthorized', 'lrn' => 'L-3', 'section' => 'A', 'grade_level' => 'Grade 1'])->assertForbidden();
+    }
+
+    public function test_student_search_and_pagination_keep_role_scoping_and_latest_assessment(): void
+    {
+        $teacher = $this->user();
+        $other = $this->user('teacher', 'active', 2);
+        $ownedId = \Illuminate\Support\Facades\DB::table('students')->insertGetId([
+            'lrn' => 'PAGE-1', 'full_name' => 'Searchable Pupil', 'section' => 'Rizal', 'grade_level' => 'Grade 2', 'teacher_id' => $teacher->id, 'score' => 12,
+        ]);
+        \Illuminate\Support\Facades\DB::table('students')->insert([
+            'lrn' => 'PAGE-2', 'full_name' => 'Other Searchable Pupil', 'section' => 'Rizal', 'grade_level' => 'Grade 2', 'teacher_id' => $other->id, 'score' => 20,
+        ]);
+        \Illuminate\Support\Facades\DB::table('assessments')->insert([
+            ['student_id' => $ownedId, 'tool' => 'CRLA-M', 'profile' => 'Instructional', 'assessment_date' => '2026-08-01'],
+            ['student_id' => $ownedId, 'tool' => 'CRLA-M', 'profile' => 'Independent', 'assessment_date' => '2026-09-15'],
+        ]);
+
+        $this->actingAs($teacher, 'sanctum')->getJson('/api/students?search=Searchable&per_page=1&page=1')
+            ->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('pagination.total', 1)
+            ->assertJsonPath('data.0.id', $ownedId)->assertJsonPath('data.0.latest_assessment', '2026-09-15');
+    }
+
+    public function test_assessment_list_supports_search_and_page_metadata(): void
+    {
+        $teacher = $this->user();
+        $studentId = \Illuminate\Support\Facades\DB::table('students')->insertGetId([
+            'lrn' => 'ASSESS-PAGE', 'full_name' => 'Assessment Pupil', 'section' => 'Rizal', 'grade_level' => 'Grade 2', 'teacher_id' => $teacher->id, 'score' => 20,
+        ]);
+        \Illuminate\Support\Facades\DB::table('assessments')->insert([
+            ['student_id' => $studentId, 'tool' => 'CRLA-M', 'profile' => 'Independent', 'assessment_date' => '2026-08-01'],
+            ['student_id' => $studentId, 'tool' => 'Phil-IRI', 'profile' => 'Instructional', 'assessment_date' => '2026-09-01'],
+        ]);
+
+        $this->actingAs($teacher, 'sanctum')->getJson('/api/assessments?search=Phil-IRI&per_page=1&page=1')
+            ->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('pagination.total', 1)
+            ->assertJsonPath('data.0.tool', 'Phil-IRI');
     }
 
     public function test_dashboard_returns_the_original_monitoring_summaries(): void

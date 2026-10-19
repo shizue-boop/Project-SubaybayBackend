@@ -62,15 +62,12 @@ class DashboardController extends Controller
             ->selectRaw("SUM(CASE WHEN reading_profile = 'Instructional' THEN 1 ELSE 0 END) as instructional")
             ->selectRaw("SUM(CASE WHEN reading_profile = 'Frustration' THEN 1 ELSE 0 END) as frustration")
             ->groupBy('grade_level')->orderBy('grade_level')->get();
-        $latestAssessments = DB::table('assessments')->select('student_id')->selectRaw('MAX(assessment_date) as latest_assessment')->groupBy('student_id');
-        $studentOverview = (clone $students)->leftJoinSub($latestAssessments, 'latest_assessments', fn ($join) => $join->on('students.id', '=', 'latest_assessments.student_id'))
-            ->orderBy('students.full_name')->get(['students.id', 'students.full_name', 'students.lrn', 'students.grade_level', 'students.section', 'students.reading_profile', 'students.score', 'latest_assessments.latest_assessment']);
         $recentProgress = DB::table('progress_updates')->join('students', 'students.id', '=', 'progress_updates.student_id')
             ->leftJoin('users', 'users.id', '=', 'progress_updates.updated_by')->whereIn('students.id', $studentIds)
             ->orderByDesc('progress_updates.update_date')->limit(6)
             ->get(['progress_updates.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as updated_by_name']);
         $upcomingSessions = DB::table('remedial_sessions')->join('students', 'students.id', '=', 'remedial_sessions.student_id')
-            ->whereIn('students.id', $studentIds)->whereDate('session_date', '>=', now()->toDateString())
+            ->whereIn('students.id', $studentIds)->where('session_date', '>=', now()->toDateString())
             ->orderBy('session_date')->orderBy('start_time')->limit(5)
             ->get(['remedial_sessions.*', 'students.full_name', 'students.grade_level', 'students.section']);
         $materialHistory = DB::table('material_distribution')->join('learning_materials', 'learning_materials.id', '=', 'material_distribution.material_id')
@@ -102,10 +99,12 @@ class DashboardController extends Controller
                 ->get(['assessments.id', 'students.full_name', 'students.grade_level', 'assessments.tool', 'assessments.total_score', 'assessments.profile', 'assessments.assessment_date']),
             'students_needing_support' => (clone $students)->whereIn('reading_profile', ['Frustration', 'Low Emerging Reader'])
                 ->orderBy('full_name')->limit(5)->get(['id', 'full_name', 'grade_level', 'section', 'reading_profile', 'score']),
-            'intervention_pupils' => (clone $students)->leftJoinSub($latestAssessments, 'latest_assessments', fn ($join) => $join->on('students.id', '=', 'latest_assessments.student_id'))
-                ->where('students.reading_profile', 'Frustration')->orderBy('students.full_name')->limit(10)
-                ->get(['students.id', 'students.full_name', 'students.grade_level', 'students.reading_profile', 'latest_assessments.latest_assessment as last_assessment']),
-            'student_overview' => $studentOverview,
+            'intervention_pupils' => (clone $students)->where('students.reading_profile', 'Frustration')->orderBy('students.full_name')->limit(10)
+                ->select('students.id', 'students.full_name', 'students.grade_level', 'students.reading_profile')
+                ->addSelect(['last_assessment' => DB::table('assessments')->select('assessment_date')
+                    ->whereColumn('assessments.student_id', 'students.id')->orderByDesc('assessment_date')->orderByDesc('id')->limit(1)])
+                ->get(),
+            'student_overview' => [],
             'level_distribution' => [
                 'independent' => $independentCount,
                 'instructional' => $instructionalCount,

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Controllers\Api\Concerns\PaginatesApiResults;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -10,13 +11,20 @@ use Illuminate\Validation\Rule;
 
 class InterventionController extends Controller
 {
+    use PaginatesApiResults;
+
     public function sessions(Request $request): JsonResponse
     {
         $query = DB::table('remedial_sessions')->join('students', 'students.id', '=', 'remedial_sessions.student_id')
             ->leftJoin('users', 'users.id', '=', 'remedial_sessions.teacher_id');
         if ($request->user()->role === 'teacher') $query->where('students.teacher_id', $request->user()->id);
-        return response()->json(['data' => $query->orderByDesc('session_date')
-            ->get(['remedial_sessions.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as teacher_name'])]);
+        if ($search = trim(mb_substr((string) $request->query('search', ''), 0, 100))) {
+            $query->where(fn ($q) => $q->where('students.full_name', 'like', '%'.$search.'%')->orWhere('students.grade_level', 'like', '%'.$search.'%')->orWhere('remedial_sessions.focus_area', 'like', '%'.$search.'%')->orWhere('remedial_sessions.session_type', 'like', '%'.$search.'%')->orWhere('remedial_sessions.status', 'like', '%'.$search.'%'));
+        }
+        $query->orderByDesc('session_date')->orderByDesc('remedial_sessions.id');
+        $columns = ['remedial_sessions.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as teacher_name'];
+        $page = $this->paginateApiQuery($request, $query, $columns);
+        return response()->json($page ?? ['data' => $query->get($columns)]);
     }
 
     public function schedule(Request $request): JsonResponse
@@ -53,18 +61,32 @@ class InterventionController extends Controller
                     ->where('remedial_attendance.attendance_date', '=', now()->toDateString());
             });
         if ($isTeacher) $sessions->where('students.teacher_id', $request->user()->id);
-        $rows = $sessions->orderByDesc('remedial_sessions.session_date')->get([
+        $sessionColumns = [
             'remedial_sessions.id', 'remedial_sessions.session_date', 'remedial_sessions.start_time', 'remedial_sessions.end_time',
             'students.id as student_id', 'students.full_name', 'students.grade_level', 'students.section',
             'teachers.full_name as teacher_name', 'remedial_attendance.status as attendance_status',
             'remedial_attendance.attendance_date', 'remedial_attendance.remarks',
-        ]);
+        ];
+        $sessions->orderByDesc('remedial_sessions.session_date')->orderByDesc('remedial_sessions.id');
+        $sessionPage = $this->paginateApiQuery($request, $sessions, $sessionColumns, 25, 'sessions_page');
+        $rows = $sessionPage['data'] ?? $sessions->get($sessionColumns);
         $history = DB::table('remedial_attendance')->join('students', 'students.id', '=', 'remedial_attendance.student_id')
             ->leftJoin('users', 'users.id', '=', 'remedial_attendance.recorded_by')
             ->when($isTeacher, fn ($query) => $query->where('students.teacher_id', $request->user()->id))
-            ->orderByDesc('attendance_date')->orderByDesc('remedial_attendance.id')
-            ->get(['remedial_attendance.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as recorded_by_name']);
-        return response()->json(['sessions' => $rows, 'history' => $history]);
+            ->orderByDesc('attendance_date')->orderByDesc('remedial_attendance.id');
+        $historyColumns = ['remedial_attendance.*', 'students.full_name', 'students.grade_level', 'students.section', 'users.full_name as recorded_by_name'];
+        $historyPage = $this->paginateApiQuery($request, $history, $historyColumns, 25, 'history_page');
+        $historyRows = $historyPage['data'] ?? $history->get($historyColumns);
+        $historyCounts = DB::table('remedial_attendance')->join('students', 'students.id', '=', 'remedial_attendance.student_id')
+            ->when($isTeacher, fn ($query) => $query->where('students.teacher_id', $request->user()->id))
+            ->select('remedial_attendance.status')->selectRaw('COUNT(*) as total')->groupBy('remedial_attendance.status')->pluck('total', 'status');
+        return response()->json([
+            'sessions' => $rows,
+            'history' => $historyRows,
+            'session_pagination' => $sessionPage['pagination'] ?? null,
+            'history_pagination' => $historyPage['pagination'] ?? null,
+            'history_counts' => ['Present' => (int) ($historyCounts['Present'] ?? 0), 'Absent' => (int) ($historyCounts['Absent'] ?? 0)],
+        ]);
     }
 
     public function recordAttendance(Request $request): JsonResponse

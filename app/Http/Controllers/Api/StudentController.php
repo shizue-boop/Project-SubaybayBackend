@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Controllers\Api\Concerns\PaginatesApiResults;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -11,17 +12,36 @@ use Illuminate\Validation\Rule;
 
 class StudentController extends Controller
 {
+    use PaginatesApiResults;
+
     public function index(Request $request): JsonResponse
     {
+        if ($request->boolean('options')) {
+            $options = DB::table('students')->select('id', 'full_name', 'grade_level', 'section')->orderBy('grade_level')->orderBy('section')->orderBy('full_name');
+            if ($request->user()->role === 'teacher') $options->where('teacher_id', $request->user()->id);
+            return response()->json(['data' => $options->get()]);
+        }
+
         $query = DB::table('students')
             ->leftJoin('users as teachers', 'teachers.id', '=', 'students.teacher_id')
-            ->select('students.*', 'teachers.full_name as teacher_name')
+            ->select('students.id', 'students.lrn', 'students.full_name', 'students.section', 'students.grade_level', 'students.teacher_id', 'students.date_enrolled', 'students.profile_image', 'students.parent_guardian', 'students.contact_number', 'students.reading_profile', 'students.score', 'teachers.full_name as teacher_name')
+            ->addSelect(['latest_assessment' => DB::table('assessments')->select('assessment_date')->whereColumn('assessments.student_id', 'students.id')->orderByDesc('assessment_date')->orderByDesc('id')->limit(1)])
             ->orderBy('students.grade_level')->orderBy('students.section')->orderBy('students.full_name');
         if ($request->user()->role === 'teacher') {
             $query->where('students.teacher_id', $request->user()->id);
         }
+        if ($section = trim((string) $request->query('section', ''))) {
+            if ($section !== 'All Sections') $query->where('students.section', $section);
+        }
+        if ($search = trim(mb_substr((string) $request->query('search', ''), 0, 100))) {
+            $query->where(fn ($q) => $q->where('students.full_name', 'like', '%'.$search.'%')->orWhere('students.lrn', 'like', '%'.$search.'%'));
+        }
 
-        $payload = ['data' => $query->get()];
+        $payload = $this->paginateApiQuery($request, $query);
+        $payload ??= ['data' => $query->get()];
+        $payload['sections'] = ($request->boolean('include_options') || !$request->hasAny(['page', 'per_page']))
+            ? DB::table('students')->distinct()->orderBy('section')->pluck('section')->filter()->values()
+            : [];
         if (in_array($request->user()->role, ['principal', 'coordinator'], true)) {
             $payload['teachers'] = DB::table('users')->where('role', 'teacher')->where('status', 'active')->orderBy('full_name')->get(['id', 'full_name', 'section', 'grade_level']);
         }
