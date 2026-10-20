@@ -7,6 +7,7 @@ use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
@@ -23,7 +24,8 @@ class AuthController extends Controller
             throw ValidationException::withMessages(['email' => ['Invalid email or password.']]);
         }
 
-        if ($user->approval_status !== 'approved' || $user->status !== 'active') {
+        $approvalStatus = $user->getAttribute('approval_status');
+        if (($approvalStatus && $approvalStatus !== 'approved') || $user->status !== 'active') {
             return response()->json([
                 'message' => 'Your account is pending approval or has been deactivated. Please contact your school administrator.',
             ], 403);
@@ -47,7 +49,7 @@ class AuthController extends Controller
             'password' => ['required', 'string', 'confirmed', 'min:8', 'regex:/[A-Z]/', 'regex:/[0-9]/'],
         ]);
 
-        $user = User::create([
+        $attributes = [
             'full_name' => trim($data['first_name'].' '.$data['last_name']),
             'email' => $data['email'],
             'employee_id' => $data['employee_id'] ?? null,
@@ -56,9 +58,10 @@ class AuthController extends Controller
             'section' => $data['section'] ?? null,
             'grade_level' => $data['grade_level'] ?? null,
             'status' => 'inactive',
-            'approval_status' => 'pending',
             'joined_date' => now()->toDateString(),
-        ]);
+        ];
+        if (Schema::hasColumn('users', 'approval_status')) $attributes['approval_status'] = 'pending';
+        $user = User::create($attributes);
 
         $labels = ['principal' => 'Principal', 'coordinator' => 'Reading Coordinator', 'teacher' => 'Teacher'];
         $details = ['Role' => $labels[$user->role], 'Name' => $user->full_name];
