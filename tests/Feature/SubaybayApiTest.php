@@ -43,7 +43,46 @@ class SubaybayApiTest extends TestCase
             'grade_level' => 'Grade 2', 'section' => 'Rizal', 'email' => 'ava@example.test',
             'password' => 'StrongPass1', 'password_confirmation' => 'StrongPass1',
         ])->assertCreated()->assertJsonPath('message', 'Registration submitted successfully. Your account is pending approval.');
-        $this->assertDatabaseHas('users', ['email' => 'ava@example.test', 'status' => 'inactive', 'role' => 'teacher']);
+        $this->assertDatabaseHas('users', ['email' => 'ava@example.test', 'status' => 'inactive', 'approval_status' => 'pending', 'role' => 'teacher']);
+    }
+
+    public function test_only_coordinator_can_approve_a_registered_account(): void
+    {
+        $this->postJson('/api/auth/register', [
+            'role' => 'teacher', 'first_name' => 'Ava', 'last_name' => 'Rivera', 'employee_id' => 'EMP-APPROVE',
+            'grade_level' => 'Grade 2', 'section' => 'Rizal', 'email' => 'approve@example.test',
+            'password' => 'StrongPass1', 'password_confirmation' => 'StrongPass1',
+        ])->assertCreated();
+        $registered = User::where('email', 'approve@example.test')->firstOrFail();
+
+        $this->actingAs($this->user('principal'), 'sanctum')
+            ->postJson("/api/account-approvals/{$registered->id}/approve")
+            ->assertForbidden();
+
+        $coordinator = $this->user('coordinator');
+        $this->actingAs($coordinator, 'sanctum')->getJson('/api/teachers')
+            ->assertOk()->assertJsonPath('pending_registrations.0.email', 'approve@example.test');
+        $this->actingAs($coordinator, 'sanctum')
+            ->postJson("/api/account-approvals/{$registered->id}/approve")
+            ->assertOk()->assertJsonPath('message', 'Registration approved. The account can now sign in.');
+
+        $this->assertDatabaseHas('users', ['id' => $registered->id, 'status' => 'active', 'approval_status' => 'approved']);
+        $this->postJson('/api/auth/login', ['email' => 'approve@example.test', 'password' => 'StrongPass1'])->assertOk();
+    }
+
+    public function test_coordinator_can_reject_pending_registration(): void
+    {
+        $pending = User::create([
+            'full_name' => 'Pending Teacher', 'email' => 'pending@example.test', 'password' => Hash::make('CorrectPass1'),
+            'role' => 'teacher', 'status' => 'inactive', 'approval_status' => 'pending', 'joined_date' => now()->toDateString(),
+        ]);
+
+        $this->actingAs($this->user('coordinator'), 'sanctum')
+            ->postJson("/api/account-approvals/{$pending->id}/reject")
+            ->assertOk();
+
+        $this->assertDatabaseHas('users', ['id' => $pending->id, 'status' => 'inactive', 'approval_status' => 'rejected']);
+        $this->postJson('/api/auth/login', ['email' => $pending->email, 'password' => 'CorrectPass1'])->assertForbidden();
     }
 
     public function test_teacher_only_sees_assigned_students_and_cannot_enroll(): void

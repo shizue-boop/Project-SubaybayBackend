@@ -87,7 +87,34 @@ class AccountController extends Controller
         $page = $this->paginateApiQuery($request, $query, $teacherColumns);
         $teachers = $page['data'] ?? $query->get($teacherColumns);
         $principal = DB::table('users')->where('role', 'principal')->orderBy('id')->first(['id', 'full_name', 'email', 'status', 'joined_date']);
-        return response()->json(array_merge(['teachers' => $teachers, 'principal' => $principal], $page ? ['pagination' => $page['pagination']] : []));
+        $pendingRegistrations = $request->user()->role === 'coordinator'
+            ? DB::table('users')->where('approval_status', 'pending')->orderBy('joined_date')->orderBy('id')
+                ->get(['id', 'full_name', 'email', 'role', 'employee_id', 'section', 'grade_level', 'joined_date'])
+            : collect();
+        return response()->json(array_merge([
+            'teachers' => $teachers,
+            'principal' => $principal,
+            'pending_registrations' => $pendingRegistrations,
+        ], $page ? ['pagination' => $page['pagination']] : []));
+    }
+
+    public function reviewRegistration(Request $request, int $user, string $action): JsonResponse
+    {
+        abort_unless($request->user()->role === 'coordinator', 403, 'Only the reading coordinator can approve registrations.');
+        $record = DB::table('users')->where('id', $user)->where('approval_status', 'pending')->first(['id', 'role']);
+        abort_unless($record, 404, 'Pending registration not found.');
+
+        if ($action === 'approve') {
+            DB::table('users')->where('id', $user)->update(['approval_status' => 'approved', 'status' => 'active']);
+            return response()->json(['message' => 'Registration approved. The account can now sign in.']);
+        }
+
+        if ($action === 'reject') {
+            DB::table('users')->where('id', $user)->update(['approval_status' => 'rejected', 'status' => 'inactive']);
+            return response()->json(['message' => 'Registration rejected.']);
+        }
+
+        abort(404);
     }
 
     public function teacherProfile(Request $request, int $teacher): JsonResponse

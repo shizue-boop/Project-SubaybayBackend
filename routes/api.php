@@ -56,6 +56,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/profile/toggle-status', [AccountController::class, 'toggleMyStatus']);
     Route::get('/users/{user}/image', [AccountController::class, 'image']);
     Route::get('/teachers', [AccountController::class, 'teachers']);
+    Route::post('/account-approvals/{user}/{action}', [AccountController::class, 'reviewRegistration'])->whereIn('action', ['approve', 'reject']);
     Route::get('/teachers/{teacher}/profile', [AccountController::class, 'teacherProfile']);
     Route::get('/teachers/principal', [AccountController::class, 'principal']);
     Route::put('/teachers/principal', [AccountController::class, 'updatePrincipal']);

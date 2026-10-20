@@ -23,7 +23,7 @@ class AuthController extends Controller
             throw ValidationException::withMessages(['email' => ['Invalid email or password.']]);
         }
 
-        if ($user->status !== 'active') {
+        if ($user->approval_status !== 'approved' || $user->status !== 'active') {
             return response()->json([
                 'message' => 'Your account is pending approval or has been deactivated. Please contact your school administrator.',
             ], 403);
@@ -56,6 +56,7 @@ class AuthController extends Controller
             'section' => $data['section'] ?? null,
             'grade_level' => $data['grade_level'] ?? null,
             'status' => 'inactive',
+            'approval_status' => 'pending',
             'joined_date' => now()->toDateString(),
         ]);
 
