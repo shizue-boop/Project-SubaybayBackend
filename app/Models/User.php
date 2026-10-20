@@ -32,7 +32,6 @@ class User extends Authenticatable
         'section',
         'grade_level',
         'status',
-        'approval_status',
         'joined_date',
         'profile_image',
         'contact_number',
