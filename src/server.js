@@ -84,15 +84,24 @@ function sendFile(res, relative, download = false) {
 }
 async function paginated(req, sql, params = [], countSql, defaultSize = 25) {
   if (!('page' in req.query) && !('per_page' in req.query)) return null
-  const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1)
-  const perPage = Math.min(100, Math.max(1, Number.parseInt(req.query.per_page || String(defaultSize), 10) || defaultSize))
+  const { page, perPage, offset } = pageBounds(req.query.page, req.query.per_page, defaultSize)
   if (!countSql) throw new Error('A count query is required for paginated endpoints.')
   const [countRow, rows] = await Promise.all([
     one(countSql, params),
-    query(`${sql} LIMIT ? OFFSET ?`, [...params, perPage, (page - 1) * perPage]),
+    // TiDB rejects LIMIT/OFFSET parameters in prepared statements. These values
+    // are parsed, bounded integers, so interpolating them is safe.
+    query(`${sql} LIMIT ${perPage} OFFSET ${offset}`, params),
   ])
   const total = Number(countRow?.total || 0)
   return { data: rows, pagination: { current_page: page, last_page: Math.max(1, Math.ceil(total / perPage)), per_page: perPage, total } }
+}
+function pageBounds(pageValue, sizeValue, defaultSize = 25) {
+  const requestedSize = Number.parseInt(sizeValue || String(defaultSize), 10)
+  const perPage = Math.min(100, Math.max(1, Number.isSafeInteger(requestedSize) ? requestedSize : defaultSize))
+  const requestedPage = Number.parseInt(pageValue || '1', 10)
+  const maxPage = Math.floor(Number.MAX_SAFE_INTEGER / perPage)
+  const page = Math.min(maxPage, Math.max(1, Number.isSafeInteger(requestedPage) ? requestedPage : 1))
+  return { page, perPage, offset: (page - 1) * perPage }
 }
 function searchLike(value) { return `%${String(value || '').trim().slice(0, 100)}%` }
 function dateOr(value, fallback) { return value || fallback }
@@ -329,13 +338,12 @@ app.post('/api/remedial-sessions', async (req,res)=>{
 app.get('/api/attendance', async (req,res)=>{
   const teacher=req.user.role==='teacher';const base=teacher?' AND s.teacher_id=?':'';const args=teacher?[req.user.id]:[]
   const sessionPageRequested='sessions_page' in req.query
-  const sessionPage=Math.max(1,Number.parseInt(req.query.sessions_page||'1',10)||1)
-  const pageSize=Math.min(100,Math.max(1,Number.parseInt(req.query.per_page||'25',10)||25))
+  const { page: sessionPage, perPage: pageSize, offset: sessionOffset } = pageBounds(req.query.sessions_page, req.query.per_page)
   const sessionSelect='SELECT r.id,r.session_date,r.start_time,r.end_time,s.id student_id,s.full_name,s.grade_level,s.section,t.full_name teacher_name,a.status attendance_status,a.attendance_date,a.remarks FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users t ON t.id=r.teacher_id LEFT JOIN remedial_attendance a ON a.session_id=r.id AND a.attendance_date=CURDATE() WHERE 1=1'+base+' ORDER BY r.session_date DESC,r.id DESC'
   const historySql=`SELECT a.*,s.full_name,s.grade_level,s.section,u.full_name recorded_by_name FROM remedial_attendance a JOIN students s ON s.id=a.student_id LEFT JOIN users u ON u.id=a.recorded_by WHERE 1=1${base} ORDER BY a.attendance_date DESC,a.id DESC`
-  const historyPageNumber=Math.max(1,Number.parseInt(req.query.history_page||'1',10)||1),historySize=Math.min(100,Math.max(1,Number.parseInt(req.query.per_page||'25',10)||25))
+  const { page: historyPageNumber, perPage: historySize, offset: historyOffset } = pageBounds(req.query.history_page, req.query.per_page)
   const sessionQuery=sessionPageRequested
-    ? query(`${sessionSelect} LIMIT ? OFFSET ?`,[...args,pageSize,(sessionPage-1)*pageSize])
+    ? query(`${sessionSelect} LIMIT ${pageSize} OFFSET ${sessionOffset}`,args)
     : query(sessionSelect,args)
   const sessionCountQuery=sessionPageRequested
     ? one(`SELECT COUNT(*) total FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE 1=1${base}`,args)
@@ -344,7 +352,7 @@ app.get('/api/attendance', async (req,res)=>{
     sessionQuery,
     sessionCountQuery,
     one(`SELECT COUNT(*) total FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base}`,args),
-    query(`${historySql} LIMIT ? OFFSET ?`,[...args,historySize,(historyPageNumber-1)*historySize]),
+    query(`${historySql} LIMIT ${historySize} OFFSET ${historyOffset}`,args),
     query(`SELECT a.status,COUNT(*) total FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base} GROUP BY a.status`,args),
   ])
   if(sessionPageRequested)sessions.pagination={current_page:sessionPage,last_page:Math.max(1,Math.ceil(Number(sessionTotal.total)/pageSize)),per_page:pageSize,total:Number(sessionTotal.total)}
