@@ -296,16 +296,16 @@ app.get('/api/dashboard', async (req, res) => {
     (SELECT COUNT(*) FROM remedial_sessions rs JOIN students s ON s.id=rs.student_id WHERE ${studentScope}1=1) AS remedial_sessions,
     (SELECT COUNT(DISTINCT s.id) FROM students s JOIN remedial_sessions rs ON rs.student_id=s.id WHERE ${studentScope}rs.status IN ('Scheduled','In Progress')) AS remedial_pupils,
     ${teacher ? '0' : "(SELECT COUNT(*) FROM users WHERE role='teacher' AND status='active')"} AS teachers,
-    (SELECT COALESCE(SUM(ra.status='Present'),0) FROM remedial_attendance ra${teacher ? ' JOIN remedial_sessions rs ON rs.id=ra.session_id WHERE rs.teacher_id=?' : ''}) AS present_attendance,
-    (SELECT COALESCE(SUM(ra.status='Absent'),0) FROM remedial_attendance ra${teacher ? ' JOIN remedial_sessions rs ON rs.id=ra.session_id WHERE rs.teacher_id=?' : ''}) AS absent_attendance
-    FROM (SELECT COUNT(*) students,COALESCE(SUM(reading_profile='Independent'),0) independent,COALESCE(SUM(reading_profile='Instructional'),0) instructional,COALESCE(SUM(reading_profile='Frustration'),0) frustration FROM students${scope}) sm`
+    attendance.present_attendance,attendance.absent_attendance
+    FROM (SELECT COUNT(*) students,COALESCE(SUM(reading_profile='Independent'),0) independent,COALESCE(SUM(reading_profile='Instructional'),0) instructional,COALESCE(SUM(reading_profile='Frustration'),0) frustration FROM students${scope}) sm
+    CROSS JOIN (SELECT COALESCE(SUM(ra.status='Present'),0) present_attendance,COALESCE(SUM(ra.status='Absent'),0) absent_attendance FROM remedial_attendance ra${teacher ? ' JOIN remedial_sessions rs ON rs.id=ra.session_id WHERE rs.teacher_id=?' : ''}) attendance`
   const metricsParams = [
     ...scopeParams,
     ...scopeParams,
     ...(teacher ? [req.user.id] : []),
     ...scopeParams,
     ...scopeParams,
-    ...(teacher ? [req.user.id, req.user.id] : []),
+    ...(teacher ? [req.user.id] : []),
   ]
   const [metrics, grades, recentAssessments, support, progress, upcoming, materials] = await Promise.all([
     one(metricsSql, metricsParams),
