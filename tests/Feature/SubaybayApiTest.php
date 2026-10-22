@@ -29,6 +29,29 @@ class SubaybayApiTest extends TestCase
         $this->withToken($response->json('token'))->getJson('/api/auth/me')->assertOk()->assertJsonPath('user.id', $user->id);
     }
 
+    public function test_url_encoded_login_is_accepted_without_json_body(): void
+    {
+        $user = $this->user();
+
+        $this->post('/api/auth/login', [
+            'email' => $user->email,
+            'password' => 'CorrectPass1',
+        ], ['Accept' => 'application/json'])
+            ->assertOk()
+            ->assertJsonPath('user.id', $user->id)
+            ->assertJsonStructure(['token']);
+    }
+
+    public function test_cors_preflight_response_can_be_cached_by_the_browser(): void
+    {
+        $this->call('OPTIONS', '/api/auth/login', [], [], [], [
+            'HTTP_ORIGIN' => 'http://localhost:5173',
+            'HTTP_ACCESS_CONTROL_REQUEST_METHOD' => 'POST',
+            'HTTP_ACCESS_CONTROL_REQUEST_HEADERS' => 'content-type',
+        ])->assertNoContent()
+            ->assertHeader('Access-Control-Max-Age', '86400');
+    }
+
     public function test_inactive_account_cannot_login(): void
     {
         $user = $this->user('teacher', 'inactive');

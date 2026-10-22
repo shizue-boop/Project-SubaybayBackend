@@ -7,6 +7,8 @@ return [
     'allowed_origins_patterns' => [],
     'allowed_headers' => ['*'],
     'exposed_headers' => [],
-    'max_age' => 0,
+    // Cache successful preflight responses so cross-origin API calls do not
+    // spend an extra network round trip on every request.
+    'max_age' => 86400,
     'supports_credentials' => false,
 ];
