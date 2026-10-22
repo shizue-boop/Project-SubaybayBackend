@@ -48,6 +48,34 @@ const imageUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize
 const nowSql = 'NOW()'
 const adminRoles = ['principal', 'coordinator']
 const safeUserFields = 'id, full_name, email, role, status, section, grade_level, profile_image, contact_number, joined_date'
+const authCacheTtlMs = Math.max(0, Number(process.env.AUTH_CACHE_TTL_MS || 10000))
+const maxCachedAuthUsers = 2000
+const authUserCache = new Map()
+
+function cachedAuthUser(tokenId, tokenHash) {
+  const entry = authUserCache.get(String(tokenId))
+  if (!entry || entry.tokenHash !== tokenHash || entry.expiresAt <= Date.now()) {
+    if (entry) authUserCache.delete(String(tokenId))
+    return null
+  }
+  // Refresh insertion order so the cache evicts least recently used entries.
+  authUserCache.delete(String(tokenId))
+  authUserCache.set(String(tokenId), entry)
+  return entry.user
+}
+function rememberAuthUser(tokenId, tokenHash, user) {
+  if (!authCacheTtlMs) return
+  const key = String(tokenId)
+  authUserCache.delete(key)
+  authUserCache.set(key, { tokenHash, user, expiresAt: Date.now() + authCacheTtlMs })
+  while (authUserCache.size > maxCachedAuthUsers) authUserCache.delete(authUserCache.keys().next().value)
+}
+function invalidateAuthUser(tokenId) { authUserCache.delete(String(tokenId)) }
+function invalidateUserAuth(userId) {
+  for (const [tokenId, entry] of authUserCache) {
+    if (String(entry.user.id) === String(userId)) authUserCache.delete(tokenId)
+  }
+}
 
 function fail(status, message, errors) {
   const error = new Error(message)
@@ -157,7 +185,11 @@ app.use('/api', async (req, _res, next) => {
     const match = header.match(/^Bearer\s+(\d+)\|([a-f0-9]+)$/i)
     if (!match) return fail(401, 'Unauthenticated.')
     const tokenHash = crypto.createHash('sha256').update(match[2]).digest('hex')
-    const user = await one("SELECT u.*, p.id AS api_token_id FROM personal_access_tokens p JOIN users u ON u.id = p.tokenable_id WHERE p.id = ? AND p.token = ? AND p.tokenable_type = ? AND u.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > NOW()) LIMIT 1", [match[1], tokenHash, 'App\\Models\\User'])
+    let user = cachedAuthUser(match[1], tokenHash)
+    if (!user) {
+      user = await one("SELECT u.id,u.full_name,u.email,u.role,u.status,u.section,u.grade_level,u.profile_image,u.contact_number,u.joined_date,p.id AS api_token_id FROM personal_access_tokens p JOIN users u ON u.id = p.tokenable_id WHERE p.id = ? AND p.token = ? AND p.tokenable_type = ? AND u.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > NOW()) LIMIT 1", [match[1], tokenHash, 'App\\Models\\User'])
+      if (user) rememberAuthUser(match[1], tokenHash, user)
+    }
     if (!user) return fail(401, 'Unauthenticated.')
     req.user = user
     req.apiTokenId = user.api_token_id
@@ -166,7 +198,7 @@ app.use('/api', async (req, _res, next) => {
 })
 
 app.get('/api/auth/me', (req, res) => res.json({ user: userView(req.user) }))
-app.post('/api/auth/logout', async (req, res) => { await query('DELETE FROM personal_access_tokens WHERE id = ?', [req.apiTokenId]); res.json({ message: 'Logged out.' }) })
+app.post('/api/auth/logout', async (req, res) => { await query('DELETE FROM personal_access_tokens WHERE id = ?', [req.apiTokenId]); invalidateAuthUser(req.apiTokenId); res.json({ message: 'Logged out.' }) })
 
 app.get('/api/students', async (req, res) => {
   if (req.query.options === '1' || req.query.options === 'true') {
@@ -180,12 +212,16 @@ app.get('/api/students', async (req, res) => {
   if (req.query.section && req.query.section !== 'All Sections') { where += ' AND s.section = ?'; params.push(req.query.section) }
   if (req.query.search) { const term = searchLike(req.query.search); where += ' AND (s.full_name LIKE ? OR s.lrn LIKE ?)'; params.push(term, term) }
   const sql = `SELECT s.id,s.lrn,s.full_name,s.section,s.grade_level,s.teacher_id,s.date_enrolled,s.profile_image,s.parent_guardian,s.contact_number,s.reading_profile,s.score,t.full_name AS teacher_name,(SELECT a.assessment_date FROM assessments a WHERE a.student_id=s.id ORDER BY a.assessment_date DESC,a.id DESC LIMIT 1) AS latest_assessment FROM students s LEFT JOIN users t ON t.id=s.teacher_id${where} ORDER BY s.grade_level,s.section,s.full_name`
-  const page = await paginated(req, sql, params, `SELECT COUNT(*) AS total FROM students s${where}`)
-  const payload = page || { data: await query(sql, params) }
-  if (req.query.include_options === '1' || !('page' in req.query || 'per_page' in req.query)) {
-    payload.sections = (await query('SELECT DISTINCT section FROM students WHERE section IS NOT NULL AND section <> \'\' ORDER BY section')).map((row) => row.section)
-  } else payload.sections = []
-  if (adminRoles.includes(req.user.role)) payload.teachers = await query("SELECT id,full_name,section,grade_level FROM users WHERE role='teacher' AND status='active' ORDER BY full_name")
+  const isPaginated = 'page' in req.query || 'per_page' in req.query
+  const includeSections = req.query.include_options === '1' || !isPaginated
+  const [page, sections, teachers] = await Promise.all([
+    isPaginated ? paginated(req, sql, params, `SELECT COUNT(*) AS total FROM students s${where}`) : query(sql, params),
+    includeSections ? query("SELECT DISTINCT section FROM students WHERE section IS NOT NULL AND section <> '' ORDER BY section") : Promise.resolve([]),
+    adminRoles.includes(req.user.role) ? query("SELECT id,full_name,section,grade_level FROM users WHERE role='teacher' AND status='active' ORDER BY full_name") : Promise.resolve([]),
+  ])
+  const payload = page?.data ? page : { data: page }
+  payload.sections = sections.map((row) => row.section)
+  if (adminRoles.includes(req.user.role)) payload.teachers = teachers
   res.json(payload)
 })
 
@@ -399,7 +435,9 @@ app.get('/api/endorsements/:id', async (req,res)=>{const reviewer=adminRoles.inc
 app.get('/api/materials', async (req,res)=>{
   const p=[];let w=' WHERE 1=1';if(req.query.search){const q=searchLike(req.query.search);w+=' AND (m.title LIKE ? OR m.material_type LIKE ? OR m.skill_focus LIKE ? OR m.description LIKE ?)';p.push(q,q,q,q)}
   for(const [key,col] of [['grade','grade_level'],['language','language'],['part','alignment_part'],['profile','reading_level']]){const v=String(req.query[key]||'').trim();if(v&&!['All Grades','All Profiles'].includes(v)){w+=` AND m.${col}=?`;p.push(v)}}
-  const sql=`SELECT m.*,u.full_name uploader_name FROM learning_materials m LEFT JOIN users u ON u.id=m.uploaded_by${w} ORDER BY m.upload_date DESC,m.id DESC`;const countSql=`SELECT COUNT(*) AS total FROM learning_materials m${w}`;const page=await paginated(req,sql,p,countSql);res.json({...page||{data:await query(sql,p)},languages:(await query('SELECT DISTINCT language FROM learning_materials WHERE language IS NOT NULL ORDER BY language')).map(r=>r.language)})
+  const sql=`SELECT m.*,u.full_name uploader_name FROM learning_materials m LEFT JOIN users u ON u.id=m.uploaded_by${w} ORDER BY m.upload_date DESC,m.id DESC`;const countSql=`SELECT COUNT(*) AS total FROM learning_materials m${w}`
+  const [page,languages]=await Promise.all([paginated(req,sql,p,countSql).then((result)=>result||query(sql,p)),query('SELECT DISTINCT language FROM learning_materials WHERE language IS NOT NULL ORDER BY language')])
+  res.json({...page,languages:languages.map(r=>r.language)})
 })
 app.get('/api/materials/:id/file', async (req,res)=>{const m=await one('SELECT file_path FROM learning_materials WHERE id=?',[req.params.id]);assert(m?.file_path,404,'File not found.');sendFile(res,m.file_path,req.query.view!=='1')})
 app.get('/api/materials/:id', async (req,res)=>{const m=await one('SELECT m.*,u.full_name uploader_name FROM learning_materials m LEFT JOIN users u ON u.id=m.uploaded_by WHERE m.id=?',[req.params.id]);assert(m,404,'Learning material not found.');res.json({data:m})})
@@ -417,23 +455,26 @@ app.get('/api/profile', async (req,res)=>{
   else {const [teachers,students,reports]=await Promise.all([one("SELECT COUNT(*) n FROM users WHERE role='teacher'"),one('SELECT COUNT(*) n FROM students'),one('SELECT COUNT(*) n FROM reports')]);stats={total_teachers:Number(teachers.n),total_students:Number(students.n),total_reports:Number(reports.n)}}
   res.json({user:Object.fromEntries(Object.entries(req.user).filter(([k])=>safeUserFields.split(', ').includes(k))),stats})
 })
-app.put('/api/profile', async (req,res)=>{const b=req.body;assert(b.full_name&&b.email,422,'Name and email are required.');const dup=await one('SELECT id FROM users WHERE email=? AND id<>?',[b.email,req.user.id]);assert(!dup,422,'Email is already in use.');await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=?,contact_number=? WHERE id=?',[b.full_name,b.email,b.section||null,b.grade_level||null,b.contact_number||null,req.user.id]);res.json({message:'Profile updated successfully!',user:await one(`SELECT ${safeUserFields} FROM users WHERE id=?`,[req.user.id])})})
-app.post('/api/profile/password', async (req,res)=>{const b=req.body;assert(b.current_password&&b.new_password&&b.confirm_password,422,'Complete all password fields.');assert(b.new_password===b.confirm_password,422,'Password confirmation does not match.');const h=String(req.user.password).replace(/^\$2y\$/,'$2b$');assert(await bcrypt.compare(b.current_password,h),422,'Current password is incorrect.');await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash(b.new_password,10),req.user.id]);res.json({message:'Password changed successfully!'})})
+app.put('/api/profile', async (req,res)=>{const b=req.body;assert(b.full_name&&b.email,422,'Name and email are required.');const dup=await one('SELECT id FROM users WHERE email=? AND id<>?',[b.email,req.user.id]);assert(!dup,422,'Email is already in use.');await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=?,contact_number=? WHERE id=?',[b.full_name,b.email,b.section||null,b.grade_level||null,b.contact_number||null,req.user.id]);invalidateUserAuth(req.user.id);res.json({message:'Profile updated successfully!',user:await one(`SELECT ${safeUserFields} FROM users WHERE id=?`,[req.user.id])})})
+app.post('/api/profile/password', async (req,res)=>{const b=req.body;assert(b.current_password&&b.new_password&&b.confirm_password,422,'Complete all password fields.');assert(b.new_password===b.confirm_password,422,'Password confirmation does not match.');const stored=await one('SELECT password FROM users WHERE id=?',[req.user.id]);const h=String(stored?.password||'').replace(/^\$2y\$/,'$2b$');assert(await bcrypt.compare(b.current_password,h),422,'Current password is incorrect.');await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash(b.new_password,10),req.user.id]);res.json({message:'Password changed successfully!'})})
 app.post('/api/profile/image', imageUpload.single('profile_image'), async (req,res)=>{assert(req.file&&/^image\/(jpeg|png|gif|webp)$/.test(req.file.mimetype),422,'Upload a JPG, PNG, GIF, or WebP image.');const f=await saveUpload(req.file,'profiles',`profile_${req.user.id}`);await query('UPDATE users SET profile_image=? WHERE id=?',[f.relative,req.user.id]);res.json({message:'Profile image updated successfully!',profile_image:f.relative})})
-app.post('/api/profile/toggle-status', async (req,res)=>{requireRole(req,adminRoles);const status=req.user.status==='active'?'inactive':'active';await query('UPDATE users SET status=? WHERE id=?',[status,req.user.id]);if(status==='inactive')await query('DELETE FROM personal_access_tokens WHERE id=?',[req.apiTokenId]);res.json({message:`Account status updated to ${status}.`,status})})
+app.post('/api/profile/toggle-status', async (req,res)=>{requireRole(req,adminRoles);const status=req.user.status==='active'?'inactive':'active';await query('UPDATE users SET status=? WHERE id=?',[status,req.user.id]);invalidateUserAuth(req.user.id);if(status==='inactive')await query('DELETE FROM personal_access_tokens WHERE id=?',[req.apiTokenId]);res.json({message:`Account status updated to ${status}.`,status})})
 app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT profile_image FROM users WHERE id=?',[req.params.id]);assert(u?.profile_image,404,'Image not found.');sendFile(res,u.profile_image)})
 
 app.get('/api/teachers', async (req,res)=>{
   requireRole(req,adminRoles);let p=[];let w=" WHERE u.role='teacher'";if(req.query.search){const q=searchLike(req.query.search);w+=' AND (u.full_name LIKE ? OR u.email LIKE ? OR u.section LIKE ? OR u.grade_level LIKE ?)';p=[q,q,q,q]}
-  const sql=`SELECT u.id,u.full_name,u.email,u.section,u.grade_level,u.status,u.joined_date,COUNT(s.id) student_count FROM users u LEFT JOIN students s ON s.teacher_id=u.id${w} GROUP BY u.id ORDER BY u.joined_date DESC,u.id DESC`;const countSql=`SELECT COUNT(*) AS total FROM users u${w}`;const page=await paginated(req,sql,p,countSql);const principal=await one("SELECT id,full_name,email,status,joined_date FROM users WHERE role='principal' ORDER BY id LIMIT 1");res.json({teachers:page?.data||await query(sql,p),principal,...(page?{pagination:page.pagination}:{})})
+  const sql=`SELECT u.id,u.full_name,u.email,u.section,u.grade_level,u.status,u.joined_date,COUNT(s.id) student_count FROM users u LEFT JOIN students s ON s.teacher_id=u.id${w} GROUP BY u.id ORDER BY u.joined_date DESC,u.id DESC`;const countSql=`SELECT COUNT(*) AS total FROM users u${w}`
+  const listPromise=('page' in req.query||'per_page' in req.query)?paginated(req,sql,p,countSql):query(sql,p)
+  const [list,principal]=await Promise.all([listPromise,one("SELECT id,full_name,email,status,joined_date FROM users WHERE role='principal' ORDER BY id LIMIT 1")])
+  res.json({teachers:list?.data||list,principal,...(list?.pagination?{pagination:list.pagination}:{})})
 })
 app.get('/api/teachers/principal', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id,full_name,email,status,joined_date FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');res.json({data:p})})
 app.put('/api/teachers/principal', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');await query('UPDATE users SET full_name=?,email=? WHERE id=?',[req.body.full_name,req.body.email,p.id]);res.json({message:'Principal account updated.'})})
-app.post('/api/teachers/principal/:action', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id,status FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');if(req.params.action==='toggle')await query('UPDATE users SET status=? WHERE id=?',[p.status==='active'?'inactive':'active',p.id]);else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),p.id]);else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Principal account reset. Temporary password: password':'Principal account status updated.'})})
+app.post('/api/teachers/principal/:action', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id,status FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');if(req.params.action==='toggle'){await query('UPDATE users SET status=? WHERE id=?',[p.status==='active'?'inactive':'active',p.id]);invalidateUserAuth(p.id)}else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),p.id]);else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Principal account reset. Temporary password: password':'Principal account status updated.'})})
 app.get('/api/teachers/:id/profile', async (req,res)=>{assert(adminRoles.includes(req.user.role)||Number(req.user.id)===Number(req.params.id),403);const teacher=await one("SELECT id,full_name,email,section,grade_level,status,joined_date,profile_image FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');const [students,assessments,sessions]=await Promise.all([query('SELECT * FROM students WHERE teacher_id=? ORDER BY full_name',[req.params.id]),query('SELECT a.*,s.full_name FROM assessments a JOIN students s ON s.id=a.student_id WHERE s.teacher_id=? ORDER BY a.assessment_date DESC LIMIT 20',[req.params.id]),query('SELECT * FROM remedial_sessions WHERE teacher_id=? ORDER BY session_date DESC LIMIT 20',[req.params.id])]);res.json({teacher,students,assessments,sessions})})
 app.post('/api/teachers', async (req,res)=>{requireRole(req,adminRoles);const b=req.body;assert(b.full_name&&b.email,422,'Name and email are required.');assert(!await one('SELECT id FROM users WHERE email=?',[b.email]),422,'Email is already in use.');const id=await insert("INSERT INTO users (full_name,email,section,grade_level,password,role,status,joined_date) VALUES (?,?,?,? ,?,'teacher','active',CURDATE())",[b.full_name,b.email,b.section||null,b.grade_level||null,await bcrypt.hash('password',10)]);res.status(201).json({message:'Teacher account created successfully!',id,temporary_password:'password'})})
 app.put('/api/teachers/:id', async (req,res)=>{requireRole(req,adminRoles);const b=req.body;const teacher=await one("SELECT id FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');assert(!await one('SELECT id FROM users WHERE email=? AND id<>?',[b.email,req.params.id]),422,'Email is already in use.');await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=? WHERE id=?',[b.full_name,b.email,b.section||null,b.grade_level||null,req.params.id]);res.json({message:'Teacher profile updated.'})})
-app.post('/api/teachers/:id/:action', async (req,res)=>{requireRole(req,adminRoles);const teacher=await one("SELECT id,status FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');if(req.params.action==='toggle')await query('UPDATE users SET status=? WHERE id=?',[teacher.status==='active'?'inactive':'active',teacher.id]);else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),teacher.id]);else if(req.params.action==='delete')await query('DELETE FROM users WHERE id=?',[teacher.id]);else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Teacher account reset. Temporary password: password':'Teacher account updated.'})})
+app.post('/api/teachers/:id/:action', async (req,res)=>{requireRole(req,adminRoles);const teacher=await one("SELECT id,status FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');if(req.params.action==='toggle'){await query('UPDATE users SET status=? WHERE id=?',[teacher.status==='active'?'inactive':'active',teacher.id]);invalidateUserAuth(teacher.id)}else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),teacher.id]);else if(req.params.action==='delete'){await query('DELETE FROM users WHERE id=?',[teacher.id]);invalidateUserAuth(teacher.id)}else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Teacher account reset. Temporary password: password':'Teacher account updated.'})})
 
 app.get('/api/settings', async (_req,res)=>{const rows=await query('SELECT setting_key,setting_value FROM app_settings');res.json({settings:Object.fromEntries(rows.map(r=>[r.setting_key,r.setting_value]))})})
 app.put('/api/settings', async (req,res)=>{requireRole(req,adminRoles);const keys=['school_name','school_id','school_address','school_contact','school_email','school_logo','school_year','program_name','grade_levels_covered','assessment_information'];await transaction(async c=>{for(const key of keys)await c.execute('INSERT INTO app_settings (setting_key,setting_value,updated_by,updated_at) VALUES (?,?,?,NOW()) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value),updated_by=VALUES(updated_by),updated_at=NOW()',[key,req.body[key]||'',req.user.id])});res.json({message:'School and reading program settings saved.'})})
