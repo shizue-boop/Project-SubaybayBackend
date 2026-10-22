@@ -384,17 +384,15 @@ app.get('/api/attendance', async (req,res)=>{
   const sessionCountQuery=sessionPageRequested
     ? one(`SELECT COUNT(*) total FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE 1=1${base}`,args)
     : Promise.resolve(null)
-  const [sessions,sessionTotal,historyTotal,historyRows,countRows]=await Promise.all([
+  const [sessions,sessionTotal,historySummary,historyRows]=await Promise.all([
     sessionQuery,
     sessionCountQuery,
-    one(`SELECT COUNT(*) total FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base}`,args),
+    one(`SELECT COUNT(*) total,COALESCE(SUM(a.status='Present'),0) present,COALESCE(SUM(a.status='Absent'),0) absent FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base}`,args),
     query(`${historySql} LIMIT ${historySize} OFFSET ${historyOffset}`,args),
-    query(`SELECT a.status,COUNT(*) total FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base} GROUP BY a.status`,args),
   ])
   if(sessionPageRequested)sessions.pagination={current_page:sessionPage,last_page:Math.max(1,Math.ceil(Number(sessionTotal.total)/pageSize)),per_page:pageSize,total:Number(sessionTotal.total)}
-  const historyPage={data:historyRows,pagination:{current_page:historyPageNumber,last_page:Math.max(1,Math.ceil(Number(historyTotal.total)/historySize)),per_page:historySize,total:Number(historyTotal.total)}}
-  const result={sessions,history:historyPage.data,session_pagination:sessions.pagination||null,history_pagination:historyPage.pagination,history_counts:{Present:0,Absent:0}}
-  for(const c of countRows)result.history_counts[c.status]=Number(c.total)
+  const historyPage={data:historyRows,pagination:{current_page:historyPageNumber,last_page:Math.max(1,Math.ceil(Number(historySummary.total)/historySize)),per_page:historySize,total:Number(historySummary.total)}}
+  const result={sessions,history:historyPage.data,session_pagination:sessions.pagination||null,history_pagination:historyPage.pagination,history_counts:{Present:Number(historySummary.present),Absent:Number(historySummary.absent)}}
   res.json(result)
 })
 app.post('/api/attendance', async (req,res)=>{
