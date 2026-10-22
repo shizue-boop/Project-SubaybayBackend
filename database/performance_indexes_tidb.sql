@@ -9,6 +9,14 @@ CREATE INDEX IF NOT EXISTS students_teacher_listing
 CREATE INDEX IF NOT EXISTS students_full_name_lookup
     ON students (full_name);
 
+CREATE INDEX IF NOT EXISTS grade_categories_grade_category
+    ON grade_categories (grade_level, category_name);
+
+CREATE INDEX IF NOT EXISTS materials_upload_date_listing
+    ON learning_materials (upload_date, id);
+CREATE INDEX IF NOT EXISTS materials_grade_date_listing
+    ON learning_materials (grade_level, upload_date, id);
+
 CREATE INDEX IF NOT EXISTS assessments_student_latest
     ON assessments (student_id, assessment_date, id);
 CREATE INDEX IF NOT EXISTS assessments_date_listing

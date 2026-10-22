@@ -2,6 +2,7 @@ import 'dotenv/config'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
 import bcrypt from 'bcryptjs'
 import cors from 'cors'
@@ -31,6 +32,16 @@ app.use(cors({ origin(origin, callback) {
 }, allowedHeaders: ['Content-Type', 'Authorization', 'Accept'], methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], maxAge: 600 }))
 app.use(express.json({ limit: '2mb' }))
 app.use(express.urlencoded({ extended: true, limit: '2mb' }))
+app.use((req, res, next) => {
+  const startedAt = performance.now()
+  res.on('finish', () => {
+    const durationMs = Math.round(performance.now() - startedAt)
+    if (durationMs >= 500 || res.statusCode >= 500) {
+      console.warn(JSON.stringify({ event: 'api_request', method: req.method, path: req.path, status: res.statusCode, duration_ms: durationMs }))
+    }
+  })
+  next()
+})
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } })
 const imageUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
@@ -71,13 +82,16 @@ function sendFile(res, relative, download = false) {
     if (error && !res.headersSent) res.status(error.statusCode || 404).json({ message: 'File not found.' })
   })
 }
-async function paginated(req, sql, params = [], defaultSize = 25) {
+async function paginated(req, sql, params = [], countSql, defaultSize = 25) {
   if (!('page' in req.query) && !('per_page' in req.query)) return null
   const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1)
   const perPage = Math.min(100, Math.max(1, Number.parseInt(req.query.per_page || String(defaultSize), 10) || defaultSize))
-  const countRows = await query(`SELECT COUNT(*) AS total FROM (${sql}) AS api_count`, params)
-  const total = Number(countRows[0]?.total || 0)
-  const rows = await query(`${sql} LIMIT ? OFFSET ?`, [...params, perPage, (page - 1) * perPage])
+  if (!countSql) throw new Error('A count query is required for paginated endpoints.')
+  const [countRow, rows] = await Promise.all([
+    one(countSql, params),
+    query(`${sql} LIMIT ? OFFSET ?`, [...params, perPage, (page - 1) * perPage]),
+  ])
+  const total = Number(countRow?.total || 0)
   return { data: rows, pagination: { current_page: page, last_page: Math.max(1, Math.ceil(total / perPage)), per_page: perPage, total } }
 }
 function searchLike(value) { return `%${String(value || '').trim().slice(0, 100)}%` }
@@ -134,13 +148,10 @@ app.use('/api', async (req, _res, next) => {
     const match = header.match(/^Bearer\s+(\d+)\|([a-f0-9]+)$/i)
     if (!match) return fail(401, 'Unauthenticated.')
     const tokenHash = crypto.createHash('sha256').update(match[2]).digest('hex')
-    const tokenRow = await one('SELECT id, tokenable_id FROM personal_access_tokens WHERE id = ? AND token = ? AND tokenable_type = ? LIMIT 1', [match[1], tokenHash, 'App\\Models\\User'])
-    if (!tokenRow) return fail(401, 'Unauthenticated.')
-    const user = await one('SELECT * FROM users WHERE id = ? LIMIT 1', [tokenRow.tokenable_id])
-    if (!user || user.status !== 'active') return fail(401, 'Unauthenticated.')
+    const user = await one("SELECT u.*, p.id AS api_token_id FROM personal_access_tokens p JOIN users u ON u.id = p.tokenable_id WHERE p.id = ? AND p.token = ? AND p.tokenable_type = ? AND u.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > NOW()) LIMIT 1", [match[1], tokenHash, 'App\\Models\\User'])
+    if (!user) return fail(401, 'Unauthenticated.')
     req.user = user
-    req.apiTokenId = tokenRow.id
-    await query('UPDATE personal_access_tokens SET last_used_at = NOW(), updated_at = NOW() WHERE id = ?', [tokenRow.id])
+    req.apiTokenId = user.api_token_id
     next()
   } catch (error) { next(error) }
 })
@@ -160,7 +171,7 @@ app.get('/api/students', async (req, res) => {
   if (req.query.section && req.query.section !== 'All Sections') { where += ' AND s.section = ?'; params.push(req.query.section) }
   if (req.query.search) { const term = searchLike(req.query.search); where += ' AND (s.full_name LIKE ? OR s.lrn LIKE ?)'; params.push(term, term) }
   const sql = `SELECT s.id,s.lrn,s.full_name,s.section,s.grade_level,s.teacher_id,s.date_enrolled,s.profile_image,s.parent_guardian,s.contact_number,s.reading_profile,s.score,t.full_name AS teacher_name,(SELECT a.assessment_date FROM assessments a WHERE a.student_id=s.id ORDER BY a.assessment_date DESC,a.id DESC LIMIT 1) AS latest_assessment FROM students s LEFT JOIN users t ON t.id=s.teacher_id${where} ORDER BY s.grade_level,s.section,s.full_name`
-  const page = await paginated(req, sql, params)
+  const page = await paginated(req, sql, params, `SELECT COUNT(*) AS total FROM students s${where}`)
   const payload = page || { data: await query(sql, params) }
   if (req.query.include_options === '1' || !('page' in req.query || 'per_page' in req.query)) {
     payload.sections = (await query('SELECT DISTINCT section FROM students WHERE section IS NOT NULL AND section <> \'\' ORDER BY section')).map((row) => row.section)
@@ -230,9 +241,9 @@ app.get('/api/dashboard', async (req, res) => {
   const teacher = req.user.role === 'teacher'
   const scope = teacher ? ' WHERE teacher_id=?' : ''
   const scopeParams = teacher ? [req.user.id] : []
-  const metrics = await one(`SELECT COUNT(*) students,COALESCE(SUM(reading_profile='Independent'),0) independent,COALESCE(SUM(reading_profile='Instructional'),0) instructional,COALESCE(SUM(reading_profile='Frustration'),0) frustration FROM students${scope}`, scopeParams)
   const studentScope = teacher ? 's.teacher_id=? AND ' : ''
-  const [assessments, pending, sessions, remedialPupils, teachers, attendance, grades, recentAssessments, support, progress, upcoming, materials] = await Promise.all([
+  const [metrics, assessments, pending, sessions, remedialPupils, teachers, attendance, grades, recentAssessments, support, progress, upcoming, materials] = await Promise.all([
+    one(`SELECT COUNT(*) students,COALESCE(SUM(reading_profile='Independent'),0) independent,COALESCE(SUM(reading_profile='Instructional'),0) instructional,COALESCE(SUM(reading_profile='Frustration'),0) frustration FROM students${scope}`, scopeParams),
     one(`SELECT COUNT(*) n FROM assessments a JOIN students s ON s.id=a.student_id WHERE ${studentScope}1=1`, scopeParams),
     one(`SELECT COUNT(*) n FROM endorsements WHERE status='Pending'${teacher ? ' AND teacher_id=?' : ''}`, teacher ? [req.user.id] : []),
     one(`SELECT COUNT(*) n FROM remedial_sessions rs JOIN students s ON s.id=rs.student_id WHERE ${studentScope}1=1`, scopeParams),
@@ -255,7 +266,8 @@ app.get('/api/assessments', async (req, res) => {
   if (req.user.role === 'teacher') { where += ' AND s.teacher_id=?'; params.push(req.user.id) }
   if (req.query.search) { const term = searchLike(req.query.search); where += ' AND (s.full_name LIKE ? OR s.grade_level LIKE ? OR a.tool LIKE ? OR a.profile LIKE ?)'; params.push(term, term, term, term) }
   const sql = `SELECT a.*,s.full_name,s.grade_level,s.section,u.full_name recorded_by_name FROM assessments a JOIN students s ON s.id=a.student_id LEFT JOIN users u ON u.id=a.recorded_by${where} ORDER BY a.assessment_date DESC,a.id DESC`
-  const page = await paginated(req, sql, params); res.json(page || { data: await query(sql, params) })
+  const countSql = `SELECT COUNT(*) AS total FROM assessments a JOIN students s ON s.id=a.student_id${where}`
+  const page = await paginated(req, sql, params, countSql); res.json(page || { data: await query(sql, params) })
 })
 app.post('/api/assessments', async (req, res) => {
   const b = req.body; const student = await one('SELECT * FROM students WHERE id=?', [b.student_id]); assert(student, 422, 'Student not found.'); requireTeacherOwn(req, student)
@@ -272,7 +284,8 @@ app.get('/api/progress-updates', async (req, res) => {
   if (req.user.role === 'teacher') { where += ' AND s.teacher_id=?'; params.push(req.user.id) }
   if (req.query.search) { const term = searchLike(req.query.search); where += ' AND (s.full_name LIKE ? OR s.grade_level LIKE ? OR p.current_profile LIKE ? OR p.trend LIKE ?)'; params.push(term,term,term,term) }
   const sql = `SELECT p.*,s.full_name,s.grade_level,s.section,u.full_name updated_by_name FROM progress_updates p JOIN students s ON s.id=p.student_id LEFT JOIN users u ON u.id=p.updated_by${where} ORDER BY p.update_date DESC,p.id DESC`
-  const page = await paginated(req,sql,params); res.json(page || {data:await query(sql,params)})
+  const countSql = `SELECT COUNT(*) AS total FROM progress_updates p JOIN students s ON s.id=p.student_id${where}`
+  const page = await paginated(req,sql,params,countSql); res.json(page || {data:await query(sql,params)})
 })
 app.post('/api/progress-updates', async (req,res) => {
   const b=req.body; const student=await one('SELECT * FROM students WHERE id=?',[b.student_id]); assert(student,422,'Student not found.'); requireTeacherOwn(req,student)
@@ -304,7 +317,8 @@ app.get('/api/remedial-sessions', async (req,res)=>{
   const p=[];let w=' WHERE 1=1';if(req.user.role==='teacher'){w+=' AND s.teacher_id=?';p.push(req.user.id)}
   if(req.query.search){const q=searchLike(req.query.search);w+=' AND (s.full_name LIKE ? OR s.grade_level LIKE ? OR r.focus_area LIKE ? OR r.session_type LIKE ? OR r.status LIKE ?)';p.push(q,q,q,q,q)}
   const sql=`SELECT r.*,s.full_name,s.grade_level,s.section,u.full_name teacher_name FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users u ON u.id=r.teacher_id${w} ORDER BY r.session_date DESC,r.id DESC`
-  const page=await paginated(req,sql,p);res.json(page||{data:await query(sql,p)})
+  const countSql=`SELECT COUNT(*) AS total FROM remedial_sessions r JOIN students s ON s.id=r.student_id${w}`
+  const page=await paginated(req,sql,p,countSql);res.json(page||{data:await query(sql,p)})
 })
 app.post('/api/remedial-sessions', async (req,res)=>{
   const b=req.body;const student=await one('SELECT * FROM students WHERE id=?',[b.student_id]);assert(student,422,'Student not found.')
@@ -314,15 +328,29 @@ app.post('/api/remedial-sessions', async (req,res)=>{
 })
 app.get('/api/attendance', async (req,res)=>{
   const teacher=req.user.role==='teacher';const base=teacher?' AND s.teacher_id=?':'';const args=teacher?[req.user.id]:[]
-  let sessions=await query(`SELECT r.id,r.session_date,r.start_time,r.end_time,s.id student_id,s.full_name,s.grade_level,s.section,t.full_name teacher_name,a.status attendance_status,a.attendance_date,a.remarks FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users t ON t.id=r.teacher_id LEFT JOIN remedial_attendance a ON a.session_id=r.id AND a.attendance_date=CURDATE() WHERE 1=1${base} ORDER BY r.session_date DESC,r.id DESC`,args)
-  let historySql=`SELECT a.*,s.full_name,s.grade_level,s.section,u.full_name recorded_by_name FROM remedial_attendance a JOIN students s ON s.id=a.student_id LEFT JOIN users u ON u.id=a.recorded_by WHERE 1=1${base} ORDER BY a.attendance_date DESC,a.id DESC`
+  const sessionPageRequested='sessions_page' in req.query
+  const sessionPage=Math.max(1,Number.parseInt(req.query.sessions_page||'1',10)||1)
+  const pageSize=Math.min(100,Math.max(1,Number.parseInt(req.query.per_page||'25',10)||25))
+  const sessionSelect='SELECT r.id,r.session_date,r.start_time,r.end_time,s.id student_id,s.full_name,s.grade_level,s.section,t.full_name teacher_name,a.status attendance_status,a.attendance_date,a.remarks FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users t ON t.id=r.teacher_id LEFT JOIN remedial_attendance a ON a.session_id=r.id AND a.attendance_date=CURDATE() WHERE 1=1'+base+' ORDER BY r.session_date DESC,r.id DESC'
+  const historySql=`SELECT a.*,s.full_name,s.grade_level,s.section,u.full_name recorded_by_name FROM remedial_attendance a JOIN students s ON s.id=a.student_id LEFT JOIN users u ON u.id=a.recorded_by WHERE 1=1${base} ORDER BY a.attendance_date DESC,a.id DESC`
   const historyPageNumber=Math.max(1,Number.parseInt(req.query.history_page||'1',10)||1),historySize=Math.min(100,Math.max(1,Number.parseInt(req.query.per_page||'25',10)||25))
-  const historyTotal=await one(`SELECT COUNT(*) total FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base}`,args)
-  const historyRows=await query(`${historySql} LIMIT ? OFFSET ?`,[...args,historySize,(historyPageNumber-1)*historySize])
+  const sessionQuery=sessionPageRequested
+    ? query(`${sessionSelect} LIMIT ? OFFSET ?`,[...args,pageSize,(sessionPage-1)*pageSize])
+    : query(sessionSelect,args)
+  const sessionCountQuery=sessionPageRequested
+    ? one(`SELECT COUNT(*) total FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE 1=1${base}`,args)
+    : Promise.resolve(null)
+  const [sessions,sessionTotal,historyTotal,historyRows,countRows]=await Promise.all([
+    sessionQuery,
+    sessionCountQuery,
+    one(`SELECT COUNT(*) total FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base}`,args),
+    query(`${historySql} LIMIT ? OFFSET ?`,[...args,historySize,(historyPageNumber-1)*historySize]),
+    query(`SELECT a.status,COUNT(*) total FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base} GROUP BY a.status`,args),
+  ])
+  if(sessionPageRequested)sessions.pagination={current_page:sessionPage,last_page:Math.max(1,Math.ceil(Number(sessionTotal.total)/pageSize)),per_page:pageSize,total:Number(sessionTotal.total)}
   const historyPage={data:historyRows,pagination:{current_page:historyPageNumber,last_page:Math.max(1,Math.ceil(Number(historyTotal.total)/historySize)),per_page:historySize,total:Number(historyTotal.total)}}
-  if('sessions_page' in req.query){const p=Math.max(1,Number(req.query.sessions_page)||1),n=Math.min(100,Math.max(1,Number(req.query.per_page)||25));const count=await one(`SELECT COUNT(*) total FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE 1=1${base}`,args);sessions=await query(`SELECT r.id,r.session_date,r.start_time,r.end_time,s.id student_id,s.full_name,s.grade_level,s.section,t.full_name teacher_name,a.status attendance_status,a.attendance_date,a.remarks FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users t ON t.id=r.teacher_id LEFT JOIN remedial_attendance a ON a.session_id=r.id AND a.attendance_date=CURDATE() WHERE 1=1${base} ORDER BY r.session_date DESC,r.id DESC LIMIT ? OFFSET ?`,[...args,n,(p-1)*n]);sessions.pagination={current_page:p,last_page:Math.max(1,Math.ceil(Number(count.total)/n)),per_page:n,total:Number(count.total)}}
   const result={sessions,history:historyPage.data,session_pagination:sessions.pagination||null,history_pagination:historyPage.pagination,history_counts:{Present:0,Absent:0}}
-  const countRows=await query(`SELECT a.status,COUNT(*) total FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base} GROUP BY a.status`,args);for(const c of countRows)result.history_counts[c.status]=Number(c.total)
+  for(const c of countRows)result.history_counts[c.status]=Number(c.total)
   res.json(result)
 })
 app.post('/api/attendance', async (req,res)=>{
@@ -337,7 +365,8 @@ app.get('/api/endorsements', async (req,res)=>{
   if(req.query.status&&req.query.status!=='All'){w+=' AND e.status=?';p.push(req.query.status)}
   if(req.query.search){const q=searchLike(req.query.search);w+=' AND (s.full_name LIKE ? OR s.grade_level LIKE ? OR t.full_name LIKE ? OR e.assessment_tool LIKE ? OR e.reading_level LIKE ?)';p.push(q,q,q,q,q)}
   const sql=`SELECT e.*,s.full_name,s.grade_level,s.section,t.full_name teacher_name FROM endorsements e JOIN students s ON s.id=e.student_id JOIN users t ON t.id=e.teacher_id${w} ORDER BY FIELD(e.status,'Pending','Returned for Revision','Approved','Rejected'),e.created_at DESC,e.id DESC`
-  const page=await paginated(req,sql,p);const data=page?.data||await query(sql,p)
+  const countSql=`SELECT COUNT(*) AS total FROM endorsements e JOIN students s ON s.id=e.student_id JOIN users t ON t.id=e.teacher_id${w}`
+  const page=await paginated(req,sql,p,countSql);const data=page?.data||await query(sql,p)
   const countRows=await query(`SELECT status,COUNT(*) total FROM endorsements${reviewer?'':' WHERE teacher_id=?'} GROUP BY status`,reviewer?[]:[req.user.id]);const counts={All:0,Pending:0,Approved:0,'Returned for Revision':0,Rejected:0};for(const c of countRows){counts[c.status]=Number(c.total);counts.All+=Number(c.total)}
   res.json({data,counts,students:reviewer?[]:await query('SELECT id,full_name,grade_level,section FROM students WHERE teacher_id=? ORDER BY full_name',[req.user.id]),reviewer,...(page?{pagination:page.pagination}:{})})
 })
@@ -362,7 +391,7 @@ app.get('/api/endorsements/:id', async (req,res)=>{const reviewer=adminRoles.inc
 app.get('/api/materials', async (req,res)=>{
   const p=[];let w=' WHERE 1=1';if(req.query.search){const q=searchLike(req.query.search);w+=' AND (m.title LIKE ? OR m.material_type LIKE ? OR m.skill_focus LIKE ? OR m.description LIKE ?)';p.push(q,q,q,q)}
   for(const [key,col] of [['grade','grade_level'],['language','language'],['part','alignment_part'],['profile','reading_level']]){const v=String(req.query[key]||'').trim();if(v&&!['All Grades','All Profiles'].includes(v)){w+=` AND m.${col}=?`;p.push(v)}}
-  const sql=`SELECT m.*,u.full_name uploader_name FROM learning_materials m LEFT JOIN users u ON u.id=m.uploaded_by${w} ORDER BY m.upload_date DESC,m.id DESC`;const page=await paginated(req,sql,p);res.json({...page||{data:await query(sql,p)},languages:(await query('SELECT DISTINCT language FROM learning_materials WHERE language IS NOT NULL ORDER BY language')).map(r=>r.language)})
+  const sql=`SELECT m.*,u.full_name uploader_name FROM learning_materials m LEFT JOIN users u ON u.id=m.uploaded_by${w} ORDER BY m.upload_date DESC,m.id DESC`;const countSql=`SELECT COUNT(*) AS total FROM learning_materials m${w}`;const page=await paginated(req,sql,p,countSql);res.json({...page||{data:await query(sql,p)},languages:(await query('SELECT DISTINCT language FROM learning_materials WHERE language IS NOT NULL ORDER BY language')).map(r=>r.language)})
 })
 app.get('/api/materials/:id/file', async (req,res)=>{const m=await one('SELECT file_path FROM learning_materials WHERE id=?',[req.params.id]);assert(m?.file_path,404,'File not found.');sendFile(res,m.file_path,req.query.view!=='1')})
 app.get('/api/materials/:id', async (req,res)=>{const m=await one('SELECT m.*,u.full_name uploader_name FROM learning_materials m LEFT JOIN users u ON u.id=m.uploaded_by WHERE m.id=?',[req.params.id]);assert(m,404,'Learning material not found.');res.json({data:m})})
@@ -388,7 +417,7 @@ app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT prof
 
 app.get('/api/teachers', async (req,res)=>{
   requireRole(req,adminRoles);let p=[];let w=" WHERE u.role='teacher'";if(req.query.search){const q=searchLike(req.query.search);w+=' AND (u.full_name LIKE ? OR u.email LIKE ? OR u.section LIKE ? OR u.grade_level LIKE ?)';p=[q,q,q,q]}
-  const sql=`SELECT u.id,u.full_name,u.email,u.section,u.grade_level,u.status,u.joined_date,COUNT(s.id) student_count FROM users u LEFT JOIN students s ON s.teacher_id=u.id${w} GROUP BY u.id ORDER BY u.joined_date DESC,u.id DESC`;const page=await paginated(req,sql,p);const principal=await one("SELECT id,full_name,email,status,joined_date FROM users WHERE role='principal' ORDER BY id LIMIT 1");res.json({teachers:page?.data||await query(sql,p),principal,...(page?{pagination:page.pagination}:{})})
+  const sql=`SELECT u.id,u.full_name,u.email,u.section,u.grade_level,u.status,u.joined_date,COUNT(s.id) student_count FROM users u LEFT JOIN students s ON s.teacher_id=u.id${w} GROUP BY u.id ORDER BY u.joined_date DESC,u.id DESC`;const countSql=`SELECT COUNT(*) AS total FROM users u${w}`;const page=await paginated(req,sql,p,countSql);const principal=await one("SELECT id,full_name,email,status,joined_date FROM users WHERE role='principal' ORDER BY id LIMIT 1");res.json({teachers:page?.data||await query(sql,p),principal,...(page?{pagination:page.pagination}:{})})
 })
 app.get('/api/teachers/principal', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id,full_name,email,status,joined_date FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');res.json({data:p})})
 app.put('/api/teachers/principal', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');await query('UPDATE users SET full_name=?,email=? WHERE id=?',[req.body.full_name,req.body.email,p.id]);res.json({message:'Principal account updated.'})})
@@ -403,7 +432,7 @@ app.put('/api/settings', async (req,res)=>{requireRole(req,adminRoles);const key
 
 app.get('/api/reports', async (req,res)=>{
   const teacher=req.user.role==='teacher';const params=[];let where=' WHERE 1=1';if(teacher){where+=' AND r.generated_by=?';params.push(req.user.id)}if(req.query.search){const q=searchLike(req.query.search);where+=' AND (r.report_title LIKE ? OR r.report_type LIKE ? OR r.status LIKE ?)';params.push(q,q,q)}
-  const sql=`SELECT r.*,u.full_name generator_name FROM reports r LEFT JOIN users u ON u.id=r.generated_by${where} ORDER BY r.created_at DESC,r.id DESC`;const page=await paginated(req,sql,params);const data=page?.data||await query(sql,params)
+  const sql=`SELECT r.*,u.full_name generator_name FROM reports r LEFT JOIN users u ON u.id=r.generated_by${where} ORDER BY r.created_at DESC,r.id DESC`;const countSql=`SELECT COUNT(*) AS total FROM reports r${where}`;const page=await paginated(req,sql,params,countSql);const data=page?.data||await query(sql,params)
   const [total,avg,assessed]=await Promise.all([one(`SELECT COUNT(*) n FROM reports r${where}`,params),one(`SELECT AVG(score) average_score FROM students WHERE score>0${teacher?' AND teacher_id=?':''}`,teacher?[req.user.id]:[]),one(`SELECT COUNT(*) n FROM assessments a JOIN students s ON s.id=a.student_id${teacher?' WHERE s.teacher_id=?':''}`,teacher?[req.user.id]:[])])
   res.json({data,total_reports:Number(total.n),average_score:Number(avg.average_score||0),total_assessed:Number(assessed.n),...(page?{pagination:page.pagination}:{})})
 })
@@ -425,14 +454,15 @@ app.post('/api/reports', async (req,res)=>{
 })
 app.get('/api/reports/:id/download', async (req,res)=>{const p=[];let where=' WHERE id=?';p.push(req.params.id);if(req.user.role==='teacher'){where+=' AND generated_by=?';p.push(req.user.id)}const r=await one(`SELECT file_path FROM reports${where}`,p);assert(r?.file_path,404,'Report not found.');res.type('html');sendFile(res,r.file_path,true)})
 
-app.use((error, _req, res, _next) => {
+app.use((error, req, res, _next) => {
   if (res.headersSent) return
   const status=Number(error.status||error.statusCode||0)
   if (String(error.code || '').startsWith('LIMIT_')) return res.status(413).json({message:'The uploaded file is too large.'})
   if (error.code==='ER_DUP_ENTRY') return res.status(422).json({message:'A record with the same unique value already exists.'})
   if (error.code==='ER_NO_SUCH_TABLE'||error.code==='ER_BAD_FIELD_ERROR') return res.status(503).json({message:'Database schema is missing or outdated.',detail:process.env.APP_DEBUG==='true'?error.message:undefined})
   if (status) return res.status(status).json({message:error.message||'Request could not be completed.',...(error.errors?{errors:error.errors}:{})})
-  console.error('API request failed:',error)
+  console.error(JSON.stringify({ event: 'api_error', method: req.method, path: req.path, code: error.code || null, message: error.message }))
+  console.error(error.stack)
   return res.status(500).json({message:process.env.APP_DEBUG==='true'?error.message:'Server error.'})
 })
 

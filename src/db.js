@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import { performance } from 'node:perf_hooks'
 import mysql from 'mysql2/promise'
 
 const host = process.env.DB_HOST || '127.0.0.1'
@@ -22,8 +23,21 @@ export const pool = mysql.createPool({
 })
 
 export async function query(sql, params = []) {
-  const [rows] = await pool.execute(sql, params)
-  return rows
+  const startedAt = performance.now()
+  try {
+    const [rows] = await pool.execute(sql, params)
+    return rows
+  } finally {
+    const durationMs = Math.round(performance.now() - startedAt)
+    const slowQueryThreshold = Number(process.env.SLOW_QUERY_THRESHOLD_MS || 500)
+    if (durationMs >= slowQueryThreshold) {
+      console.warn(JSON.stringify({
+        event: 'slow_db_query',
+        duration_ms: durationMs,
+        sql: sql.replace(/\s+/g, ' ').trim().slice(0, 180),
+      }))
+    }
+  }
 }
 
 export async function one(sql, params = []) {
