@@ -126,6 +126,7 @@ function activityLabel(req) {
   if (/^\/materials\/\d+$/.test(path) && method === 'PUT') return 'updated a learning material'
   if (/^\/materials\/\d+$/.test(path) && method === 'DELETE') return 'removed a learning material'
   if (path === '/profile') return 'updated their profile'
+  if (path === '/profile/image' && method === 'DELETE') return 'removed their profile photo'
   if (path === '/profile/image') return 'changed their profile photo'
   if (path === '/profile/password') return 'updated their account security settings'
   if (path === '/settings') return 'updated school settings'
@@ -601,6 +602,23 @@ app.get('/api/profile', async (req,res)=>{
 app.put('/api/profile', async (req,res)=>{const b=req.body;assert(b.full_name&&b.email,422,'Name and email are required.');const dup=await one('SELECT id FROM users WHERE email=? AND id<>?',[b.email,req.user.id]);assert(!dup,422,'Email is already in use.');await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=?,contact_number=? WHERE id=?',[b.full_name,b.email,b.section||null,b.grade_level||null,b.contact_number||null,req.user.id]);invalidateUserAuth(req.user.id);res.json({message:'Profile updated successfully!',user:await one(`SELECT ${safeUserFields} FROM users WHERE id=?`,[req.user.id])})})
 app.post('/api/profile/password', async (req,res)=>{const b=req.body;assert(b.current_password&&b.new_password&&b.confirm_password,422,'Complete all password fields.');assert(b.new_password===b.confirm_password,422,'Password confirmation does not match.');const stored=await one('SELECT password FROM users WHERE id=?',[req.user.id]);const h=String(stored?.password||'').replace(/^\$2y\$/,'$2b$');assert(await bcrypt.compare(b.current_password,h),422,'Current password is incorrect.');await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash(b.new_password,10),req.user.id]);res.json({message:'Password changed successfully!'})})
 app.post('/api/profile/image', imageUpload.single('profile_image'), async (req,res)=>{assert(req.file&&/^image\/(jpeg|png|gif|webp)$/.test(req.file.mimetype),422,'Upload a JPG, PNG, GIF, or WebP image.');const imagePath=await saveProfileImage(req.file,'user',req.user.id);await query('UPDATE users SET profile_image=? WHERE id=?',[imagePath,req.user.id]);invalidateUserAuth(req.user.id);res.json({message:'Profile image updated successfully!',profile_image:imagePath})})
+app.delete('/api/profile/image', async (req,res)=>{
+  const current=await one('SELECT profile_image FROM users WHERE id=?',[req.user.id])
+  await ensureProfileImagesTable()
+  await transaction(async connection=>{
+    await connection.execute('DELETE FROM profile_images WHERE owner_type=? AND owner_id=?',['user',req.user.id])
+    await connection.execute('UPDATE users SET profile_image=NULL WHERE id=?',[req.user.id])
+  })
+  invalidateUserAuth(req.user.id)
+  if(current?.profile_image&&!current.profile_image.startsWith('db-image:')){
+    const target=filePath(current.profile_image)
+    if(target.startsWith(storageRoot+path.sep)) {
+      try { await fs.rm(target,{force:true}) }
+      catch(error) { console.warn(JSON.stringify({event:'profile_image_file_cleanup_failed',user_id:req.user.id,message:error.message})) }
+    }
+  }
+  res.json({message:'Profile photo removed successfully.'})
+})
 app.post('/api/profile/toggle-status', async (req,res)=>{requireRole(req,adminRoles);const status=req.user.status==='active'?'inactive':'active';await query('UPDATE users SET status=? WHERE id=?',[status,req.user.id]);invalidateUserAuth(req.user.id);if(status==='inactive')await query('DELETE FROM personal_access_tokens WHERE id=?',[req.apiTokenId]);res.json({message:`Account status updated to ${status}.`,status})})
 app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT profile_image FROM users WHERE id=?',[req.params.id]);assert(u,404,'User not found.');await sendProfileImage(res,'user',req.params.id,u.profile_image)})
 
