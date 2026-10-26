@@ -517,6 +517,18 @@ app.put('/api/remedial-sessions/:id', async (req,res)=>{
   await query('UPDATE remedial_sessions SET student_id=?,related_endorsement_id=?,teacher_id=?,session_date=?,start_time=?,end_time=?,focus_area=?,session_type=?,notes=? WHERE id=?',[student.id,relatedEndorsementId,teacherId,b.session_date,b.start_time,b.end_time,b.focus_area,b.session_type,b.notes||null,current.id])
   res.json({message:'Session record updated.'})
 })
+app.delete('/api/remedial-sessions/:id', async (req,res)=>{
+  const session=await one('SELECT id,student_id,teacher_id FROM remedial_sessions WHERE id=?',[req.params.id]);assert(session,404,'Session record not found.')
+  if(req.user.role==='teacher'){
+    const student=await one('SELECT * FROM students WHERE id=?',[session.student_id]);assert(student,404,'Pupil not found.')
+    requireTeacherOwn(req,student);assert(Number(session.teacher_id)===Number(req.user.id),403,'You can delete only sessions assigned to you.')
+  }else requireRole(req,adminRoles)
+  await transaction(async connection=>{
+    await connection.execute('DELETE FROM remedial_attendance WHERE session_id=?',[session.id])
+    await connection.execute('DELETE FROM remedial_sessions WHERE id=?',[session.id])
+  })
+  res.json({message:'Session record and its linked attendance were deleted.'})
+})
 app.get('/api/attendance', async (req,res)=>{
   const teacher=req.user.role==='teacher';const base=teacher?' AND s.teacher_id=?':'';const args=teacher?[req.user.id]:[]
   if(req.query.from)validateDate(req.query.from,'from')
