@@ -137,7 +137,11 @@ function pageBounds(pageValue, sizeValue, defaultSize = 25) {
 function searchLike(value) { return `%${String(value || '').trim().slice(0, 100)}%` }
 function dateOr(value, fallback) { return value || fallback }
 function validateDate(value, field) {
-  if (!value || Number.isNaN(Date.parse(value))) fail(422, `The ${field} field must be a valid date.`, { [field]: ['The field must be a valid date.'] })
+  const date = String(value || '')
+  const parsed = /^\d{4}-\d{2}-\d{2}$/.test(date) ? new Date(`${date}T00:00:00.000Z`) : null
+  if (!parsed || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
+    fail(422, `The ${field} field must be a valid date.`, { [field]: ['The field must be a valid date.'] })
+  }
 }
 function requireRole(req, roles) { assert(roles.includes(req.user.role), 403, 'You are not authorized to perform this action.') }
 function requireTeacherOwn(req, student) { assert(req.user.role !== 'teacher' || Number(student.teacher_id) === Number(req.user.id), 403) }
@@ -403,7 +407,7 @@ app.get('/api/attendance', async (req,res)=>{
   const historyArgs=[...args,...(req.query.from?[req.query.from]:[]),...(req.query.to?[req.query.to]:[]),...searchParams]
   const sessionPageRequested='sessions_page' in req.query
   const { page: sessionPage, perPage: pageSize, offset: sessionOffset } = pageBounds(req.query.sessions_page, req.query.per_page)
-  const sessionSelect='SELECT r.id,r.session_date,r.start_time,r.end_time,s.id student_id,s.full_name,s.grade_level,s.section,t.full_name teacher_name,a.status attendance_status,a.attendance_date,a.remarks FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users t ON t.id=r.teacher_id LEFT JOIN remedial_attendance a ON a.session_id=r.id AND a.id=(SELECT MAX(a2.id) FROM remedial_attendance a2 WHERE a2.session_id=r.id) WHERE 1=1'+base+sessionDateFilter+searchFilter+' ORDER BY r.session_date DESC,r.id DESC'
+  const sessionSelect='SELECT r.id,r.session_date,r.start_time,r.end_time,s.id student_id,s.full_name,s.grade_level,s.section,t.full_name teacher_name,a.status attendance_status,a.attendance_date,a.remarks FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users t ON t.id=r.teacher_id LEFT JOIN (SELECT session_id,MAX(id) attendance_id FROM remedial_attendance GROUP BY session_id) latest_attendance ON latest_attendance.session_id=r.id LEFT JOIN remedial_attendance a ON a.id=latest_attendance.attendance_id WHERE 1=1'+base+sessionDateFilter+searchFilter+' ORDER BY r.session_date DESC,r.id DESC'
   const historySql=`SELECT a.*,s.full_name,s.grade_level,s.section,u.full_name recorded_by_name FROM remedial_attendance a JOIN students s ON s.id=a.student_id LEFT JOIN users u ON u.id=a.recorded_by WHERE 1=1${base}${historyDateFilter}${searchFilter} ORDER BY a.attendance_date DESC,a.id DESC`
   const { page: historyPageNumber, perPage: historySize, offset: historyOffset } = pageBounds(req.query.history_page, req.query.per_page)
   const sessionQuery=sessionPageRequested
@@ -425,9 +429,11 @@ app.get('/api/attendance', async (req,res)=>{
 })
 app.post('/api/attendance', async (req,res)=>{
   requireRole(req,['teacher'])
-  const b=req.body;const session=await one(`SELECT r.id,r.student_id,s.teacher_id FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE r.id=?`,[b.session_id]);assert(session,403,'That remedial session is not available for attendance recording.');requireTeacherOwn(req,session)
-  assert(b.attendance_date&&['Present','Absent'].includes(b.status),422,'Attendance date and status are required.')
-  await query('INSERT INTO remedial_attendance (session_id,student_id,attendance_date,status,remarks,recorded_by) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE student_id=VALUES(student_id),status=VALUES(status),remarks=VALUES(remarks),recorded_by=VALUES(recorded_by)',[session.id,session.student_id,b.attendance_date,b.status,b.remarks||'',req.user.id]);res.json({message:'Attendance recorded.'})
+  const b=req.body;const sessionId=Number(b.session_id);assert(Number.isSafeInteger(sessionId)&&sessionId>0,422,'Select a valid remedial session.')
+  const session=await one(`SELECT r.id,r.student_id,r.session_date,s.teacher_id FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE r.id=?`,[sessionId]);assert(session,403,'That remedial session is not available for attendance recording.');requireTeacherOwn(req,session)
+  validateDate(b.attendance_date,'attendance_date');assert(b.attendance_date===session.session_date,422,'Attendance date must match the remedial session date.')
+  assert(['Present','Absent'].includes(b.status),422,'Choose Present or Absent for attendance status.')
+  await query('INSERT INTO remedial_attendance (session_id,student_id,attendance_date,status,remarks,recorded_by) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status=VALUES(status),remarks=VALUES(remarks),recorded_by=VALUES(recorded_by)',[session.id,session.student_id,session.session_date,b.status,b.remarks||'',req.user.id]);res.json({message:'Attendance recorded.'})
 })
 
 app.get('/api/endorsements', async (req,res)=>{
