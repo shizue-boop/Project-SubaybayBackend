@@ -79,14 +79,7 @@ async function recordNotification(message) {
 
 async function ensureProfileImagesTable() {
   if (!profileImagesTableReady) {
-    profileImagesTableReady = query(`CREATE TABLE IF NOT EXISTS profile_images (
-      owner_type VARCHAR(16) NOT NULL,
-      owner_id BIGINT UNSIGNED NOT NULL,
-      mime_type VARCHAR(64) NOT NULL,
-      image_data MEDIUMBLOB NOT NULL,
-      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      PRIMARY KEY (owner_type, owner_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+    profileImagesTableReady = query('SELECT 1 FROM profile_images LIMIT 0')
       .catch((error) => { profileImagesTableReady = null; throw error })
   }
   await profileImagesTableReady
@@ -656,8 +649,10 @@ app.get('/api/reports/:id/download', async (req,res)=>{const p=[];let where=' WH
 app.use((error, req, res, _next) => {
   if (res.headersSent) return
   const status=Number(error.status||error.statusCode||0)
+  const routePath=req.path.startsWith('/api/')?req.path.slice(4):req.path
   if (String(error.code || '').startsWith('LIMIT_')) return res.status(413).json({message:'The uploaded file is too large.'})
   if (error.code==='ER_DUP_ENTRY') return res.status(422).json({message:'A record with the same unique value already exists.'})
+  if (error.code==='ER_NO_SUCH_TABLE' && (routePath==='/profile/image' || /^\/users\/\d+\/image$/.test(routePath))) return res.status(503).json({message:'Profile photo storage is not set up. Apply backend/database/profile_images_tidb.sql to the TiDB database.'})
   if (error.code==='ER_NO_SUCH_TABLE'||error.code==='ER_BAD_FIELD_ERROR') return res.status(503).json({message:'Database schema is missing or outdated.',detail:process.env.APP_DEBUG==='true'?error.message:undefined})
   if (status) return res.status(status).json({message:error.message||'Request could not be completed.',...(error.errors?{errors:error.errors}:{})})
   console.error(JSON.stringify({ event: 'api_error', method: req.method, path: req.path, code: error.code || null, message: error.message }))

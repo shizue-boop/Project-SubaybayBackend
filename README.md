@@ -17,6 +17,10 @@ For TiDB Cloud, use its **Public** connection host and port, allowlist Render's 
 
 ## Render
 
-The root `render.yaml` configures a Node web service with `npm ci` and `npm start`. Configure `DB_HOST`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`, and `FRONTEND_ORIGINS` in Render. Render Free has an ephemeral filesystem, so uploads stored by this API can be lost after a restart; use an object-storage service or a plan with persistent storage if uploaded files must persist.
+The root `render.yaml` configures a Node web service with `npm ci` and `npm start`. Configure `DB_HOST`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`, and `FRONTEND_ORIGINS` in Render. Render Free has an ephemeral filesystem, so uploaded documents and materials can be lost after a restart. Account profile photos are stored in TiDB after applying the migration below.
 
 The API reuses the existing `personal_access_tokens` table format so the frontend's Bearer token flow remains compatible. Existing valid tokens in that table can continue to work; new logins issue tokens in the same format.
+
+### Persistent profile photos
+
+Before deploying profile photo uploads, run [`database/profile_images_tidb.sql`](database/profile_images_tidb.sql) once against the production TiDB database. The API stores account profile photo bytes in this table so they survive Render restarts. The database account used by the API only needs normal `SELECT` and `INSERT`/`UPDATE` access to the table after it has been created.
