@@ -161,13 +161,12 @@ app.post('/api/auth/login', async (req, res) => {
 })
 
 app.post('/api/auth/register', async (req, res) => {
-  const { role, first_name, last_name, employee_id, grade_level, section, email, password, password_confirmation } = req.body
+  const { role, first_name, last_name, grade_level, section, email, password, password_confirmation } = req.body
   const errors = {}
   if (!['principal', 'coordinator', 'teacher'].includes(role)) errors.role = ['Select a valid role.']
   if (!String(first_name || '').trim()) errors.first_name = ['First name is required.']
   if (!String(last_name || '').trim()) errors.last_name = ['Last name is required.']
   if (!/^\S+@\S+\.\S+$/.test(String(email || ''))) errors.email = ['Enter a valid email address.']
-  if (role === 'teacher' && !employee_id) errors.employee_id = ['Employee ID is required for teachers.']
   if (role === 'teacher' && !grade_level) errors.grade_level = ['Grade level is required for teachers.']
   if (role === 'teacher' && !section) errors.section = ['Section is required for teachers.']
   if (String(password || '').length < 8 || !/[A-Z]/.test(password) || !/[0-9]/.test(password)) errors.password = ['Password must have at least 8 characters, one uppercase letter, and one number.']
@@ -175,9 +174,9 @@ app.post('/api/auth/register', async (req, res) => {
   if (Object.keys(errors).length) fail(422, 'The given data was invalid.', errors)
   if (await one('SELECT id FROM users WHERE email = ? LIMIT 1', [email])) fail(422, 'The email has already been taken.', { email: ['The email has already been taken.'] })
   const fullName = `${first_name.trim()} ${last_name.trim()}`
-  const id = await insert('INSERT INTO users (full_name,email,employee_id,password,role,section,grade_level,status,joined_date) VALUES (?,?,?,?,?,?,? ,\'inactive\',CURDATE())', [fullName, email, employee_id || null, await bcrypt.hash(password, 10), role, section || null, grade_level || null])
+  const id = await insert('INSERT INTO users (full_name,email,password,role,section,grade_level,status,joined_date) VALUES (?,?,?,?,?,?,\'inactive\',CURDATE())', [fullName, email, await bcrypt.hash(password, 10), role, section || null, grade_level || null])
   const details = { Role: role[0].toUpperCase() + role.slice(1), Name: fullName, Email: email }
-  if (role === 'teacher') { details['Employee ID'] = employee_id; details['Assigned To'] = `${grade_level || ''} — ${section || ''}`.trim() }
+  if (role === 'teacher') details['Assigned To'] = `${grade_level || ''} — ${section || ''}`.trim()
   res.status(201).json({ message: 'Registration submitted successfully. Your account is pending approval.', details, id })
 })
 
@@ -196,6 +195,10 @@ app.use('/api', async (req, _res, next) => {
     if (!user) return fail(401, 'Unauthenticated.')
     req.user = user
     req.apiTokenId = user.api_token_id
+    const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase())
+    const principalSelfService = ['/auth/logout', '/profile', '/profile/password', '/profile/image'].includes(req.path)
+    const reportGeneration = req.path === '/reports' && req.method === 'POST'
+    if (user.role === 'principal' && isWrite && !principalSelfService && !reportGeneration) return fail(403, 'Principal accounts have view-only access.')
     next()
   } catch (error) { next(error) }
 })
@@ -213,6 +216,7 @@ app.get('/api/students', async (req, res) => {
   let where = ' WHERE 1=1'
   if (req.user.role === 'teacher') { where += ' AND s.teacher_id = ?'; params.push(req.user.id) }
   if (req.query.section && req.query.section !== 'All Sections') { where += ' AND s.section = ?'; params.push(req.query.section) }
+  if (req.query.reading_level) { where += ' AND s.reading_profile = ?'; params.push(req.query.reading_level) }
   if (req.query.search) { const term = searchLike(req.query.search); where += ' AND (s.full_name LIKE ? OR s.lrn LIKE ?)'; params.push(term, term) }
   const sql = `SELECT s.id,s.lrn,s.full_name,s.section,s.grade_level,s.teacher_id,s.date_enrolled,s.profile_image,s.parent_guardian,s.contact_number,s.reading_profile,s.score,t.full_name AS teacher_name,(SELECT a.assessment_date FROM assessments a WHERE a.student_id=s.id ORDER BY a.assessment_date DESC,a.id DESC LIMIT 1) AS latest_assessment FROM students s LEFT JOIN users t ON t.id=s.teacher_id${where} ORDER BY s.grade_level,s.section,s.full_name`
   const isPaginated = 'page' in req.query || 'per_page' in req.query
@@ -231,12 +235,11 @@ app.get('/api/students', async (req, res) => {
 app.post('/api/students', imageUpload.single('profile_image'), async (req, res) => {
   requireRole(req, adminRoles)
   const body = req.body
-  assert(body.full_name && body.lrn && body.section && body.grade_level, 422, 'Student name, LRN, section, and grade level are required.')
-  assert(String(body.lrn).length <= 12, 422, 'LRN must be 12 characters or fewer.')
+  assert(body.full_name && body.lrn && body.section && body.grade_level, 422, 'Pupil name, LRN, section, and grade level are required.')
+  assert(/^\d{12}$/.test(String(body.lrn)), 422, 'LRN must contain exactly 12 digits.')
   if (await one('SELECT id FROM students WHERE lrn = ?', [body.lrn])) fail(422, 'The LRN has already been taken.')
   let teacherId = body.teacher_id || null
   if (teacherId) assert(await one("SELECT id FROM users WHERE id=? AND role='teacher' AND status='active'", [teacherId]), 422, 'Select an active teacher.')
-  else teacherId = (await one("SELECT id FROM users WHERE section=? AND role='teacher' AND status='active' LIMIT 1", [body.section]))?.id || null
   let imagePath = null
   if (req.file) imagePath = (await saveUpload(req.file, 'students', 'student')).relative
   const id = await insert('INSERT INTO students (lrn,full_name,section,grade_level,teacher_id,date_enrolled,parent_guardian,contact_number,profile_image) VALUES (?,?,?,?,?,?,?,?,?)', [body.lrn, body.full_name, body.section, body.grade_level, teacherId, body.date_enrolled || new Date().toISOString().slice(0, 10), body.parent_guardian || null, body.contact_number || null, imagePath])
@@ -245,15 +248,16 @@ app.post('/api/students', imageUpload.single('profile_image'), async (req, res) 
 
 app.get('/api/students/:id/details', async (req, res) => {
   const student = await one('SELECT s.*,u.full_name AS teacher_name FROM students s LEFT JOIN users u ON u.id=s.teacher_id WHERE s.id=?', [req.params.id])
-  assert(student, 404, 'Student not found.')
+  assert(student, 404, 'Pupil not found.')
   requireTeacherOwn(req, student)
-  const [assessments, progress, endorsements, sessions] = await Promise.all([
+  const [assessments, progress, endorsements, sessions, attendance] = await Promise.all([
     query('SELECT * FROM assessments WHERE student_id=? ORDER BY assessment_date DESC,id DESC', [student.id]),
     query('SELECT * FROM progress_updates WHERE student_id=? ORDER BY update_date DESC,id DESC', [student.id]),
     query('SELECT * FROM endorsements WHERE student_id=? ORDER BY created_at DESC,id DESC', [student.id]),
     query('SELECT * FROM remedial_sessions WHERE student_id=? ORDER BY session_date DESC,id DESC', [student.id]),
+    query('SELECT a.*,r.focus_area,r.session_type,u.full_name AS recorded_by_name FROM remedial_attendance a LEFT JOIN remedial_sessions r ON r.id=a.session_id LEFT JOIN users u ON u.id=a.recorded_by WHERE a.student_id=? ORDER BY a.attendance_date DESC,a.id DESC', [student.id]),
   ])
-  res.json({ student, assessments, progress, endorsements, sessions })
+  res.json({ student, assessments, progress, endorsements, sessions, attendance })
 })
 app.get('/api/students/:id/image', async (req, res) => {
   const student = await one('SELECT teacher_id,profile_image FROM students WHERE id=?', [req.params.id])
@@ -263,7 +267,7 @@ app.get('/api/students/:id/image', async (req, res) => {
 })
 app.get('/api/students/:id', async (req, res) => {
   const student = await one('SELECT * FROM students WHERE id=?', [req.params.id])
-  assert(student, 404, 'Student not found.')
+  assert(student, 404, 'Pupil not found.')
   requireTeacherOwn(req, student)
   res.json({ data: student })
 })
@@ -272,17 +276,18 @@ app.put('/api/students/:id', async (req, res) => {
   const fields = ['full_name','lrn','section','grade_level','date_enrolled','parent_guardian','contact_number','teacher_id']
   const data = Object.fromEntries(fields.filter((key) => key in req.body).map((key) => [key, req.body[key] || null]))
   assert(data.full_name && data.lrn && data.section && data.grade_level && data.teacher_id, 422, 'Required student fields are missing.')
+  assert(/^\d{12}$/.test(String(data.lrn)), 422, 'LRN must contain exactly 12 digits.')
   const duplicate = await one('SELECT id FROM students WHERE lrn=? AND id<>?', [data.lrn, req.params.id])
   assert(!duplicate, 422, 'The LRN has already been taken.')
   assert(await one("SELECT id FROM users WHERE id=? AND role='teacher' AND status='active'", [data.teacher_id]), 422, 'Select an active teacher.')
   await query('UPDATE students SET full_name=?,lrn=?,section=?,grade_level=?,date_enrolled=?,parent_guardian=?,contact_number=?,teacher_id=? WHERE id=?', [...fields.map((key) => data[key] ?? null), req.params.id])
-  const row = await one('SELECT * FROM students WHERE id=?', [req.params.id]); assert(row, 404, 'Student not found.')
+  const row = await one('SELECT * FROM students WHERE id=?', [req.params.id]); assert(row, 404, 'Pupil not found.')
   res.json({ data: row })
 })
 app.delete('/api/students/:id', async (req, res) => {
   requireRole(req, adminRoles)
-  const result = await query('DELETE FROM students WHERE id=?', [req.params.id]); assert(result.affectedRows, 404, 'Student not found.')
-  res.json({ message: 'Student removed.' })
+  const result = await query('DELETE FROM students WHERE id=?', [req.params.id]); assert(result.affectedRows, 404, 'Pupil not found.')
+  res.json({ message: 'Pupil removed.' })
 })
 
 app.get('/api/dashboard', async (req, res) => {
@@ -312,7 +317,7 @@ app.get('/api/dashboard', async (req, res) => {
     query(`SELECT grade_level,SUM(reading_profile='Independent') independent,SUM(reading_profile='Instructional') instructional,SUM(reading_profile='Frustration') frustration FROM students${scope} GROUP BY grade_level ORDER BY grade_level`, scopeParams),
     query(`SELECT a.id,s.full_name,s.grade_level,a.tool,a.total_score,a.profile,a.assessment_date FROM assessments a JOIN students s ON s.id=a.student_id WHERE ${studentScope}1=1 ORDER BY a.assessment_date DESC,a.id DESC LIMIT 5`, scopeParams),
     query(`SELECT id,full_name,grade_level,section,reading_profile,score FROM students${scope}${teacher ? ' AND' : ' WHERE'} reading_profile IN ('Frustration','Low Emerging Reader') ORDER BY full_name LIMIT 5`, scopeParams),
-    query(`SELECT pu.id,pu.previous_profile,pu.current_profile,pu.trend,pu.update_date,s.full_name,s.grade_level,s.section FROM progress_updates pu JOIN students s ON s.id=pu.student_id WHERE ${studentScope}1=1 ORDER BY pu.update_date DESC LIMIT 6`, scopeParams),
+    query(`SELECT pu.id,pu.student_id,pu.previous_profile,pu.current_profile,pu.trend,pu.update_date,s.full_name,s.grade_level,s.section FROM progress_updates pu JOIN students s ON s.id=pu.student_id WHERE ${studentScope}1=1 ORDER BY pu.update_date DESC LIMIT 6`, scopeParams),
     query(`SELECT rs.id,rs.session_date,rs.start_time,rs.session_type,rs.status,s.full_name,s.grade_level,s.section FROM remedial_sessions rs JOIN students s ON s.id=rs.student_id WHERE ${studentScope}rs.session_date>=CURDATE() ORDER BY rs.session_date,rs.start_time LIMIT 5`, scopeParams),
     query(`SELECT lm.title,lm.material_type,md.given_to,md.grade_level,md.date_given,u.full_name given_by_name FROM material_distribution md JOIN learning_materials lm ON lm.id=md.material_id LEFT JOIN users u ON u.id=md.given_by LEFT JOIN students s ON s.full_name=md.given_to WHERE ${teacher ? '(md.given_by=? OR s.teacher_id=?) AND ' : ''}1=1 ORDER BY md.date_given DESC LIMIT 6`, teacher ? [req.user.id, req.user.id] : []),
   ])
@@ -329,7 +334,7 @@ app.get('/api/assessments', async (req, res) => {
   const page = await paginated(req, sql, params, countSql); res.json(page || { data: await query(sql, params) })
 })
 app.post('/api/assessments', async (req, res) => {
-  const b = req.body; const student = await one('SELECT * FROM students WHERE id=?', [b.student_id]); assert(student, 422, 'Student not found.'); requireTeacherOwn(req, student)
+  const b = req.body; const student = await one('SELECT * FROM students WHERE id=?', [b.student_id]); assert(student, 422, 'Pupil not found.'); requireTeacherOwn(req, student)
   for (const key of ['assessment_date','tool','profile']) assert(b[key], 422, `The ${key} field is required.`)
   const score = ['task1_score','words_score','sentences_score'].map((key) => Number(b[key] || 0)); assert(score.every((x) => Number.isInteger(x) && x >= 0), 422, 'Scores must be non-negative integers.')
   const id = await transaction(async (conn) => {
@@ -347,7 +352,7 @@ app.get('/api/progress-updates', async (req, res) => {
   const page = await paginated(req,sql,params,countSql); res.json(page || {data:await query(sql,params)})
 })
 app.post('/api/progress-updates', async (req,res) => {
-  const b=req.body; const student=await one('SELECT * FROM students WHERE id=?',[b.student_id]); assert(student,422,'Student not found.'); requireTeacherOwn(req,student)
+  const b=req.body; const student=await one('SELECT * FROM students WHERE id=?',[b.student_id]); assert(student,422,'Pupil not found.'); requireTeacherOwn(req,student)
   for(const k of ['previous_profile','current_profile','trend','update_date']) assert(b[k],422,`The ${k} field is required.`)
   const id=await transaction(async conn=>{const [r]=await conn.execute('INSERT INTO progress_updates (student_id,previous_profile,current_profile,trend,update_date,updated_by,remarks) VALUES (?,?,?,?,?,?,?)',[student.id,b.previous_profile,b.current_profile,b.trend,b.update_date,req.user.id,b.remarks||null]);await conn.execute('UPDATE students SET reading_profile=? WHERE id=?',[b.current_profile,student.id]);return r.insertId})
   res.status(201).json({data:await one('SELECT * FROM progress_updates WHERE id=?',[id])})
@@ -380,29 +385,38 @@ app.get('/api/remedial-sessions', async (req,res)=>{
   const page=await paginated(req,sql,p,countSql);res.json(page||{data:await query(sql,p)})
 })
 app.post('/api/remedial-sessions', async (req,res)=>{
-  const b=req.body;const student=await one('SELECT * FROM students WHERE id=?',[b.student_id]);assert(student,422,'Student not found.')
+  const b=req.body;const student=await one('SELECT * FROM students WHERE id=?',[b.student_id]);assert(student,422,'Pupil not found.')
   let teacherId=b.teacher_id||student.teacher_id||null;if(req.user.role==='teacher'){requireTeacherOwn(req,student);teacherId=req.user.id}else requireRole(req,adminRoles)
   assert(b.session_date&&b.start_time&&b.end_time&&b.focus_area&&b.session_type,422,'Required session fields are missing.')
   const id=await insert("INSERT INTO remedial_sessions (student_id,teacher_id,session_date,start_time,end_time,focus_area,session_type,status,notes) VALUES (?,?,?,?,?,?,?,'Scheduled',?)",[student.id,teacherId,b.session_date,b.start_time,b.end_time,b.focus_area,b.session_type,b.notes||null]);res.status(201).json({data:await one('SELECT * FROM remedial_sessions WHERE id=?',[id])})
 })
 app.get('/api/attendance', async (req,res)=>{
   const teacher=req.user.role==='teacher';const base=teacher?' AND s.teacher_id=?':'';const args=teacher?[req.user.id]:[]
+  if(req.query.from)validateDate(req.query.from,'from')
+  if(req.query.to)validateDate(req.query.to,'to')
+  assert(!req.query.from||!req.query.to||req.query.from<=req.query.to,422,'Start date must be on or before end date.')
+  const sessionDateFilter=(req.query.from?' AND r.session_date>=?':'')+(req.query.to?' AND r.session_date<=?':'')
+  const historyDateFilter=(req.query.from?' AND a.attendance_date>=?':'')+(req.query.to?' AND a.attendance_date<=?':'')
+  const searchFilter=req.query.search?' AND (s.full_name LIKE ? OR s.lrn LIKE ?)':''
+  const searchParams=req.query.search?[searchLike(req.query.search),searchLike(req.query.search)]:[]
+  const sessionArgs=[...args,...(req.query.from?[req.query.from]:[]),...(req.query.to?[req.query.to]:[]),...searchParams]
+  const historyArgs=[...args,...(req.query.from?[req.query.from]:[]),...(req.query.to?[req.query.to]:[]),...searchParams]
   const sessionPageRequested='sessions_page' in req.query
   const { page: sessionPage, perPage: pageSize, offset: sessionOffset } = pageBounds(req.query.sessions_page, req.query.per_page)
-  const sessionSelect='SELECT r.id,r.session_date,r.start_time,r.end_time,s.id student_id,s.full_name,s.grade_level,s.section,t.full_name teacher_name,a.status attendance_status,a.attendance_date,a.remarks FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users t ON t.id=r.teacher_id LEFT JOIN remedial_attendance a ON a.session_id=r.id AND a.attendance_date=CURDATE() WHERE 1=1'+base+' ORDER BY r.session_date DESC,r.id DESC'
-  const historySql=`SELECT a.*,s.full_name,s.grade_level,s.section,u.full_name recorded_by_name FROM remedial_attendance a JOIN students s ON s.id=a.student_id LEFT JOIN users u ON u.id=a.recorded_by WHERE 1=1${base} ORDER BY a.attendance_date DESC,a.id DESC`
+  const sessionSelect='SELECT r.id,r.session_date,r.start_time,r.end_time,s.id student_id,s.full_name,s.grade_level,s.section,t.full_name teacher_name,a.status attendance_status,a.attendance_date,a.remarks FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users t ON t.id=r.teacher_id LEFT JOIN remedial_attendance a ON a.session_id=r.id AND a.id=(SELECT MAX(a2.id) FROM remedial_attendance a2 WHERE a2.session_id=r.id) WHERE 1=1'+base+sessionDateFilter+searchFilter+' ORDER BY r.session_date DESC,r.id DESC'
+  const historySql=`SELECT a.*,s.full_name,s.grade_level,s.section,u.full_name recorded_by_name FROM remedial_attendance a JOIN students s ON s.id=a.student_id LEFT JOIN users u ON u.id=a.recorded_by WHERE 1=1${base}${historyDateFilter}${searchFilter} ORDER BY a.attendance_date DESC,a.id DESC`
   const { page: historyPageNumber, perPage: historySize, offset: historyOffset } = pageBounds(req.query.history_page, req.query.per_page)
   const sessionQuery=sessionPageRequested
-    ? query(`${sessionSelect} LIMIT ${pageSize} OFFSET ${sessionOffset}`,args)
-    : query(sessionSelect,args)
+    ? query(`${sessionSelect} LIMIT ${pageSize} OFFSET ${sessionOffset}`,sessionArgs)
+    : query(sessionSelect,sessionArgs)
   const sessionCountQuery=sessionPageRequested
-    ? one(`SELECT COUNT(*) total FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE 1=1${base}`,args)
+    ? one(`SELECT COUNT(*) total FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE 1=1${base}${sessionDateFilter}${searchFilter}`,sessionArgs)
     : Promise.resolve(null)
   const [sessions,sessionTotal,historySummary,historyRows]=await Promise.all([
     sessionQuery,
     sessionCountQuery,
-    one(`SELECT COUNT(*) total,COALESCE(SUM(a.status='Present'),0) present,COALESCE(SUM(a.status='Absent'),0) absent FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base}`,args),
-    query(`${historySql} LIMIT ${historySize} OFFSET ${historyOffset}`,args),
+    one(`SELECT COUNT(*) total,COALESCE(SUM(a.status='Present'),0) present,COALESCE(SUM(a.status='Absent'),0) absent FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE 1=1${base}${historyDateFilter}${searchFilter}`,historyArgs),
+    query(`${historySql} LIMIT ${historySize} OFFSET ${historyOffset}`,historyArgs),
   ])
   if(sessionPageRequested)sessions.pagination={current_page:sessionPage,last_page:Math.max(1,Math.ceil(Number(sessionTotal.total)/pageSize)),per_page:pageSize,total:Number(sessionTotal.total)}
   const historyPage={data:historyRows,pagination:{current_page:historyPageNumber,last_page:Math.max(1,Math.ceil(Number(historySummary.total)/historySize)),per_page:historySize,total:Number(historySummary.total)}}
@@ -410,6 +424,7 @@ app.get('/api/attendance', async (req,res)=>{
   res.json(result)
 })
 app.post('/api/attendance', async (req,res)=>{
+  requireRole(req,['teacher'])
   const b=req.body;const session=await one(`SELECT r.id,r.student_id,s.teacher_id FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE r.id=?`,[b.session_id]);assert(session,403,'That remedial session is not available for attendance recording.');requireTeacherOwn(req,session)
   assert(b.attendance_date&&['Present','Absent'].includes(b.status),422,'Attendance date and status are required.')
   await query('INSERT INTO remedial_attendance (session_id,student_id,attendance_date,status,remarks,recorded_by) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE student_id=VALUES(student_id),status=VALUES(status),remarks=VALUES(remarks),recorded_by=VALUES(recorded_by)',[session.id,session.student_id,b.attendance_date,b.status,b.remarks||'',req.user.id]);res.json({message:'Attendance recorded.'})
@@ -502,15 +517,15 @@ app.post('/api/reports', async (req,res)=>{
   const type=b.report_type,start=b.start_date,end=b.end_date,teacher=req.user.role==='teacher',uid=req.user.id;let headers=[],rows=[]
   if(type==='progress'){
     const params=[start,end];let scope='';if(teacher){scope=' AND s.teacher_id=?';params.push(uid)}
-    const data=await query(`SELECT s.full_name,s.grade_level,s.section,a.tool,a.total_score,a.profile,a.assessment_date FROM assessments a JOIN students s ON s.id=a.student_id WHERE a.assessment_date BETWEEN ? AND ?${scope} ORDER BY a.assessment_date DESC,s.full_name`,params);rows=data.map(r=>[r.full_name,`${r.grade_level} - ${r.section}`,r.tool,r.total_score,r.profile,r.assessment_date]);headers=['Student','Grade / Section','Assessment','Score','Reading Level','Date']
+    const data=await query(`SELECT s.full_name,s.grade_level,s.section,a.tool,a.total_score,a.profile,a.assessment_date FROM assessments a JOIN students s ON s.id=a.student_id WHERE a.assessment_date BETWEEN ? AND ?${scope} ORDER BY a.assessment_date DESC,s.full_name`,params);rows=data.map(r=>[r.full_name,`${r.grade_level} - ${r.section}`,r.tool,r.total_score,r.profile,r.assessment_date]);headers=['Pupil','Grade / Section','Assessment','Score','Reading Level','Date']
   }else if(type==='attendance'){
     const params=[start,end];let scope='';if(teacher){scope=' AND s.teacher_id=?';params.push(uid)}
-    const data=await query(`SELECT s.full_name,s.grade_level,s.section,a.status,a.remarks,a.attendance_date FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE a.attendance_date BETWEEN ? AND ?${scope} ORDER BY a.attendance_date DESC,s.full_name`,params);rows=data.map(r=>[r.full_name,`${r.grade_level} - ${r.section}`,r.status,r.remarks||'-',r.attendance_date]);headers=['Student','Grade / Section','Status','Remarks','Date']
+    const data=await query(`SELECT s.full_name,s.grade_level,s.section,a.status,a.remarks,a.attendance_date FROM remedial_attendance a JOIN students s ON s.id=a.student_id WHERE a.attendance_date BETWEEN ? AND ?${scope} ORDER BY a.attendance_date DESC,s.full_name`,params);rows=data.map(r=>[r.full_name,`${r.grade_level} - ${r.section}`,r.status,r.remarks||'-',r.attendance_date]);headers=['Pupil','Grade / Section','Status','Remarks','Date']
   }else{
     const defs=[['Assessments','assessments','assessment_date','recorded_by'],['Progress updates','progress_updates','update_date','updated_by'],['Attendance records','remedial_attendance','attendance_date','recorded_by'],['Remedial sessions','remedial_sessions','session_date','teacher_id'],['Endorsements','endorsements','created_at','teacher_id'],['Materials distributed','material_distribution','date_given','given_by']]
     for(const [label,table,col,owner] of defs){const args=[start,end];const dateWhere=table==='endorsements'?`${col} >= ? AND ${col} < DATE_ADD(?,INTERVAL 1 DAY)`:`${col} BETWEEN ? AND ?`;let scope='';if(teacher){scope=` AND ${owner}=?`;args.push(uid)}const r=await one(`SELECT COUNT(*) n FROM ${table} WHERE ${dateWhere}${scope}`,args);rows.push([label,Number(r.n)])}headers=['Activity','Total']
   }
-  const titles={activity:'Teacher Activity Report',progress:'Student Progress Report',attendance:'Attendance Report'};const title=`${titles[type]} (${start} to ${end})`;const esc=v=>String(v??'-').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let html=`<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><style>body{font-family:Arial,sans-serif;color:#1e293b;margin:40px}table{border-collapse:collapse;width:100%;margin-top:24px}th,td{border:1px solid #cbd5e1;padding:10px;text-align:left}th{background:#e2e8f0}</style></head><body><h1>${esc(title)}</h1><p>Generated on ${new Date().toLocaleString('en-PH')}</p><table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.length?rows.map(r=>`<tr>${r.map(v=>`<td>${esc(v)}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${headers.length}">No activity found for this period.</td></tr>`}</tbody></table></body></html>`
+  const titles={activity:'Teacher Activity Report',progress:'Pupil Progress Report',attendance:'Attendance Report'};const title=`${titles[type]} (${start} to ${end})`;const esc=v=>String(v??'-').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let html=`<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><style>body{font-family:Arial,sans-serif;color:#1e293b;margin:40px}table{border-collapse:collapse;width:100%;margin-top:24px}th,td{border:1px solid #cbd5e1;padding:10px;text-align:left}th{background:#e2e8f0}</style></head><body><h1>${esc(title)}</h1><p>Generated on ${new Date().toLocaleString('en-PH')}</p><table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.length?rows.map(r=>`<tr>${r.map(v=>`<td>${esc(v)}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${headers.length}">No activity found for this period.</td></tr>`}</tbody></table></body></html>`
   const saved=await saveUpload({buffer:Buffer.from(html),originalname:'report.html',mimetype:'text/html',size:Buffer.byteLength(html)},'reports',`report_${uid}`);const id=await insert("INSERT INTO reports (report_title,report_type,generated_by,generated_date,file_format,status,file_path,created_at) VALUES (?,?,?,NOW(),'HTML','Ready',?,NOW())",[title,type,uid,saved.relative]);res.status(201).json({message:'Report generated successfully.',data:await one('SELECT * FROM reports WHERE id=?',[id])})
 })
 app.get('/api/reports/:id/download', async (req,res)=>{const p=[];let where=' WHERE id=?';p.push(req.params.id);if(req.user.role==='teacher'){where+=' AND generated_by=?';p.push(req.user.id)}const r=await one(`SELECT file_path FROM reports${where}`,p);assert(r?.file_path,404,'Report not found.');res.type('html');sendFile(res,r.file_path,true)})
