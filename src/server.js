@@ -495,7 +495,7 @@ app.post('/api/schedule', async (req,res)=>{
 app.get('/api/remedial-sessions', async (req,res)=>{
   const p=[];let w=' WHERE 1=1';if(req.user.role==='teacher'){w+=' AND s.teacher_id=?';p.push(req.user.id)}
   if(req.query.search){const q=searchLike(req.query.search);w+=' AND (s.full_name LIKE ? OR s.grade_level LIKE ? OR r.focus_area LIKE ? OR r.session_type LIKE ? OR r.status LIKE ?)';p.push(q,q,q,q,q)}
-  const sql=`SELECT r.*,s.full_name,s.grade_level,s.section,u.full_name teacher_name,COALESCE(r.related_endorsement_id,(SELECT e.id FROM endorsements e WHERE e.student_id=r.student_id AND e.status='Approved' ORDER BY e.reviewed_at DESC,e.id DESC LIMIT 1)) related_endorsement_id,recorder.full_name recorded_by_name FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users u ON u.id=r.teacher_id LEFT JOIN users recorder ON recorder.id=r.recorded_by${w} ORDER BY r.session_date DESC,r.id DESC`
+  const sql=`SELECT r.*,s.full_name,s.grade_level,s.section,u.full_name teacher_name,COALESCE(r.related_endorsement_id,(SELECT e.id FROM endorsements e WHERE e.student_id=r.student_id AND e.status='Approved' ORDER BY e.reviewed_at DESC,e.id DESC LIMIT 1)) effective_related_endorsement_id,recorder.full_name recorded_by_name FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users u ON u.id=r.teacher_id LEFT JOIN users recorder ON recorder.id=r.recorded_by${w} ORDER BY r.session_date DESC,r.id DESC`
   const countSql=`SELECT COUNT(*) AS total FROM remedial_sessions r JOIN students s ON s.id=r.student_id${w}`
   const page=await paginated(req,sql,p,countSql);res.json(page||{data:await query(sql,p)})
 })
