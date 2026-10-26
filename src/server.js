@@ -91,6 +91,9 @@ function fileExt(file) {
   const types = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp', 'application/pdf': 'pdf', 'application/msword': 'doc', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx', 'audio/mpeg': 'mp3', 'application/vnd.ms-powerpoint': 'ppt', 'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx', 'application/vnd.ms-excel': 'xls', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx' }
   return types[file.mimetype] || path.extname(file.originalname).slice(1).toLowerCase()
 }
+function assertStudentPhoto(file) {
+  if (file) assert(file.size > 0 && ['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(file.mimetype), 422, 'Upload a JPG, PNG, GIF, or WebP image.')
+}
 function safeFilename(value) { return path.basename(String(value || 'file').replace(/[^\w. -]/g, '_')) }
 async function saveUpload(file, folder, prefix = 'file') {
   assert(file, 422, 'A file is required.')
@@ -239,6 +242,7 @@ app.get('/api/students', async (req, res) => {
 app.post('/api/students', imageUpload.single('profile_image'), async (req, res) => {
   requireRole(req, adminRoles)
   const body = req.body
+  assertStudentPhoto(req.file)
   assert(body.full_name && body.lrn && body.section && body.grade_level, 422, 'Pupil name, LRN, section, and grade level are required.')
   assert(/^\d{12}$/.test(String(body.lrn)), 422, 'LRN must contain exactly 12 digits.')
   if (await one('SELECT id FROM students WHERE lrn = ?', [body.lrn])) fail(422, 'The LRN has already been taken.')
@@ -275,8 +279,9 @@ app.get('/api/students/:id', async (req, res) => {
   requireTeacherOwn(req, student)
   res.json({ data: student })
 })
-app.put('/api/students/:id', async (req, res) => {
+app.put('/api/students/:id', imageUpload.single('profile_image'), async (req, res) => {
   requireRole(req, ['coordinator'])
+  assertStudentPhoto(req.file)
   const fields = ['full_name','lrn','section','grade_level','date_enrolled','parent_guardian','contact_number','teacher_id']
   const data = Object.fromEntries(fields.filter((key) => key in req.body).map((key) => [key, req.body[key] || null]))
   assert(data.full_name && data.lrn && data.section && data.grade_level && data.teacher_id, 422, 'Required student fields are missing.')
@@ -284,7 +289,8 @@ app.put('/api/students/:id', async (req, res) => {
   const duplicate = await one('SELECT id FROM students WHERE lrn=? AND id<>?', [data.lrn, req.params.id])
   assert(!duplicate, 422, 'The LRN has already been taken.')
   assert(await one("SELECT id FROM users WHERE id=? AND role='teacher' AND status='active'", [data.teacher_id]), 422, 'Select an active teacher.')
-  await query('UPDATE students SET full_name=?,lrn=?,section=?,grade_level=?,date_enrolled=?,parent_guardian=?,contact_number=?,teacher_id=? WHERE id=?', [...fields.map((key) => data[key] ?? null), req.params.id])
+  const profileImage = req.file ? (await saveUpload(req.file, 'students', 'student')).relative : null
+  await query('UPDATE students SET full_name=?,lrn=?,section=?,grade_level=?,date_enrolled=?,parent_guardian=?,contact_number=?,teacher_id=?,profile_image=COALESCE(?,profile_image) WHERE id=?', [...fields.map((key) => data[key] ?? null), profileImage, req.params.id])
   const row = await one('SELECT * FROM students WHERE id=?', [req.params.id]); assert(row, 404, 'Pupil not found.')
   res.json({ data: row })
 })
