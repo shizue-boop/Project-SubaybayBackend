@@ -1,10 +1,14 @@
--- Apply once to add explicit endorsement and recorder links to remedial sessions.
+-- Run the statements in order. TiDB validates each ALTER TABLE against the
+-- table schema as it exists before that statement, so keep new columns and
+-- indexes in separate ALTER TABLE statements.
 ALTER TABLE remedial_sessions
-    ADD COLUMN related_endorsement_id INT(11) NULL AFTER student_id,
-    ADD COLUMN recorded_by INT(11) NULL AFTER teacher_id,
-    ADD INDEX idx_remedial_sessions_related_endorsement (related_endorsement_id),
-    ADD INDEX idx_remedial_sessions_recorded_by (recorded_by),
-    ADD CONSTRAINT fk_remedial_sessions_related_endorsement
-        FOREIGN KEY (related_endorsement_id) REFERENCES endorsements (id) ON DELETE SET NULL,
-    ADD CONSTRAINT fk_remedial_sessions_recorded_by
-        FOREIGN KEY (recorded_by) REFERENCES users (id) ON DELETE SET NULL;
+    ADD COLUMN IF NOT EXISTS related_endorsement_id INT NULL AFTER student_id;
+
+ALTER TABLE remedial_sessions
+    ADD COLUMN IF NOT EXISTS recorded_by INT NULL AFTER teacher_id;
+
+ALTER TABLE remedial_sessions
+    ADD INDEX IF NOT EXISTS idx_remedial_sessions_related_endorsement (related_endorsement_id);
+
+ALTER TABLE remedial_sessions
+    ADD INDEX IF NOT EXISTS idx_remedial_sessions_recorded_by (recorded_by);
