@@ -51,6 +51,59 @@ const safeUserFields = 'id, full_name, email, role, status, section, grade_level
 const authCacheTtlMs = Math.max(0, Number(process.env.AUTH_CACHE_TTL_MS || 10000))
 const maxCachedAuthUsers = 2000
 const authUserCache = new Map()
+let notificationTableReady
+
+async function ensureNotificationTable() {
+  if (!notificationTableReady) {
+    notificationTableReady = query(`CREATE TABLE IF NOT EXISTS system_notifications (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      message VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_system_notifications_created_at (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+      .catch((error) => { notificationTableReady = null; throw error })
+  }
+  await notificationTableReady
+}
+
+async function recordNotification(message) {
+  try {
+    await ensureNotificationTable()
+    await query('INSERT INTO system_notifications (message) VALUES (?)', [message.slice(0, 255)])
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'notification_write_failed', message: error.message }))
+  }
+}
+
+function activityLabel(req) {
+  const path = req.path
+  const method = req.method.toUpperCase()
+  if (path === '/students' && method === 'POST') return 'added a pupil'
+  if (/^\/students\/\d+$/.test(path) && method === 'PUT') return 'updated a pupil record'
+  if (/^\/students\/\d+$/.test(path) && method === 'DELETE') return 'removed a pupil'
+  if (path === '/assessments') return 'recorded a reading assessment'
+  if (path === '/progress-updates') return 'updated a pupil’s reading progress'
+  if (path === '/attendance') return 'recorded remedial attendance'
+  if (path === '/remedial-sessions') return 'scheduled a remedial session'
+  if (path === '/endorsements') return 'submitted an endorsement'
+  if (/^\/endorsements\/\d+\/review$/.test(path)) return 'reviewed an endorsement'
+  if (path === '/schedule') return 'updated the schedule'
+  if (path === '/materials' && method === 'POST') return 'added a learning material'
+  if (/^\/materials\/\d+$/.test(path) && method === 'PUT') return 'updated a learning material'
+  if (/^\/materials\/\d+$/.test(path) && method === 'DELETE') return 'removed a learning material'
+  if (path === '/profile') return 'updated their profile'
+  if (path === '/profile/image') return 'changed their profile photo'
+  if (path === '/profile/password') return 'updated their account security settings'
+  if (path === '/settings') return 'updated school settings'
+  if (path === '/reports') return 'generated a report'
+  if (path === '/teachers') return 'added a teacher account'
+  if (/^\/teachers\/\d+$/.test(path) && method === 'PUT') return 'updated a teacher account'
+  if (/^\/teachers\/\d+\/(toggle|reset-password|delete)$/.test(path)) return 'updated a teacher account'
+  if (path === '/teachers/principal') return 'updated the principal account'
+  if (path.startsWith('/grade-categories')) return 'updated reading grade categories'
+  return `made changes in ${path.split('/').filter(Boolean)[0]?.replaceAll('-', ' ') || 'the system'}`
+}
 
 function cachedAuthUser(tokenId, tokenHash) {
   const entry = authUserCache.get(String(tokenId))
@@ -164,6 +217,7 @@ app.post('/api/auth/login', async (req, res) => {
   const plain = crypto.randomBytes(32).toString('hex')
   const tokenHash = crypto.createHash('sha256').update(plain).digest('hex')
   const tokenId = await insert('INSERT INTO personal_access_tokens (tokenable_type, tokenable_id, name, token, abilities, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NOW(), NOW())', ['App\\Models\\User', user.id, 'reading-web', tokenHash, '["*"]'])
+  await recordNotification(`${user.full_name} logged in`)
   res.json({ token: `${tokenId}|${plain}`, user: userView(user) })
 })
 
@@ -184,6 +238,7 @@ app.post('/api/auth/register', async (req, res) => {
   const id = await insert('INSERT INTO users (full_name,email,password,role,section,grade_level,status,joined_date) VALUES (?,?,?,?,?,?,\'inactive\',CURDATE())', [fullName, email, await bcrypt.hash(password, 10), role, section || null, grade_level || null])
   const details = { Role: role[0].toUpperCase() + role.slice(1), Name: fullName, Email: email }
   if (role === 'teacher') details['Assigned To'] = `${grade_level || ''} — ${section || ''}`.trim()
+  await recordNotification(`${fullName} submitted an account registration`)
   res.status(201).json({ message: 'Registration submitted successfully. Your account is pending approval.', details, id })
 })
 
@@ -206,12 +261,28 @@ app.use('/api', async (req, _res, next) => {
     const principalSelfService = ['/auth/logout', '/profile', '/profile/password', '/profile/image'].includes(req.path)
     const reportGeneration = req.path === '/reports' && req.method === 'POST'
     if (user.role === 'principal' && isWrite && !principalSelfService && !reportGeneration) return fail(403, 'Principal accounts have view-only access.')
+    if (isWrite && req.path !== '/auth/logout' && req.path !== '/notifications/read') {
+      const message = `${user.full_name} ${activityLabel(req)}`
+      res.on('finish', () => {
+        if (res.statusCode >= 200 && res.statusCode < 400) {
+          void recordNotification(message)
+        }
+      })
+    }
     next()
   } catch (error) { next(error) }
 })
 
 app.get('/api/auth/me', (req, res) => res.json({ user: userView(req.user) }))
-app.post('/api/auth/logout', async (req, res) => { await query('DELETE FROM personal_access_tokens WHERE id = ?', [req.apiTokenId]); invalidateAuthUser(req.apiTokenId); res.json({ message: 'Logged out.' }) })
+app.get('/api/notifications', async (req, res) => {
+  await ensureNotificationTable()
+  const afterId = Math.max(0, Number.parseInt(req.query.after_id || '0', 10) || 0)
+  const notifications = afterId
+    ? await query('SELECT id,message,created_at FROM system_notifications WHERE id>? ORDER BY id ASC LIMIT 25', [afterId])
+    : await query('SELECT id,message,created_at FROM system_notifications WHERE created_at>=NOW()-INTERVAL 30 SECOND ORDER BY id DESC LIMIT 10', [])
+  res.json({ data: afterId ? notifications : notifications.reverse() })
+})
+app.post('/api/auth/logout', async (req, res) => { await recordNotification(`${req.user.full_name} logged out`); await query('DELETE FROM personal_access_tokens WHERE id = ?', [req.apiTokenId]); invalidateAuthUser(req.apiTokenId); res.json({ message: 'Logged out.' }) })
 
 app.get('/api/students', async (req, res) => {
   if (req.query.options === '1' || req.query.options === 'true') {
