@@ -275,7 +275,7 @@ app.post('/api/auth/register', async (req, res) => {
   res.status(201).json({ message: 'Registration submitted successfully. Your account is pending approval.', details, id })
 })
 
-app.use('/api', async (req, _res, next) => {
+app.use('/api', async (req, res, next) => {
   if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/register') return next()
   try {
     const header = String(req.headers.authorization || '')
