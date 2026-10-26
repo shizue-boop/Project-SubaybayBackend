@@ -495,7 +495,7 @@ app.post('/api/schedule', async (req,res)=>{
 app.get('/api/remedial-sessions', async (req,res)=>{
   const p=[];let w=' WHERE 1=1';if(req.user.role==='teacher'){w+=' AND s.teacher_id=?';p.push(req.user.id)}
   if(req.query.search){const q=searchLike(req.query.search);w+=' AND (s.full_name LIKE ? OR s.grade_level LIKE ? OR r.focus_area LIKE ? OR r.session_type LIKE ? OR r.status LIKE ?)';p.push(q,q,q,q,q)}
-  const sql=`SELECT r.*,s.full_name,s.grade_level,s.section,u.full_name teacher_name,(SELECT e.id FROM endorsements e WHERE e.student_id=r.student_id AND e.status='Approved' ORDER BY e.reviewed_at DESC,e.id DESC LIMIT 1) related_endorsement_id FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users u ON u.id=r.teacher_id${w} ORDER BY r.session_date DESC,r.id DESC`
+  const sql=`SELECT r.*,s.full_name,s.grade_level,s.section,u.full_name teacher_name,COALESCE(r.related_endorsement_id,(SELECT e.id FROM endorsements e WHERE e.student_id=r.student_id AND e.status='Approved' ORDER BY e.reviewed_at DESC,e.id DESC LIMIT 1)) related_endorsement_id,recorder.full_name recorded_by_name FROM remedial_sessions r JOIN students s ON s.id=r.student_id LEFT JOIN users u ON u.id=r.teacher_id LEFT JOIN users recorder ON recorder.id=r.recorded_by${w} ORDER BY r.session_date DESC,r.id DESC`
   const countSql=`SELECT COUNT(*) AS total FROM remedial_sessions r JOIN students s ON s.id=r.student_id${w}`
   const page=await paginated(req,sql,p,countSql);res.json(page||{data:await query(sql,p)})
 })
@@ -503,7 +503,8 @@ app.post('/api/remedial-sessions', async (req,res)=>{
   const b=req.body;const student=await one('SELECT * FROM students WHERE id=?',[b.student_id]);assert(student,422,'Pupil not found.')
   let teacherId=b.teacher_id||student.teacher_id||null;if(req.user.role==='teacher'){requireTeacherOwn(req,student);teacherId=req.user.id}else requireRole(req,adminRoles)
   assert(b.session_date&&b.start_time&&b.end_time&&b.focus_area&&b.session_type,422,'Required session fields are missing.')
-  const id=await insert("INSERT INTO remedial_sessions (student_id,teacher_id,session_date,start_time,end_time,focus_area,session_type,status,notes) VALUES (?,?,?,?,?,?,?,'Scheduled',?)",[student.id,teacherId,b.session_date,b.start_time,b.end_time,b.focus_area,b.session_type,b.notes||null]);res.status(201).json({data:await one('SELECT * FROM remedial_sessions WHERE id=?',[id])})
+  let relatedEndorsementId=null;if(b.related_endorsement_id){relatedEndorsementId=Number(b.related_endorsement_id);assert(Number.isSafeInteger(relatedEndorsementId)&&relatedEndorsementId>0,422,'Select a valid related endorsement.');assert(await one("SELECT id FROM endorsements WHERE id=? AND student_id=? AND status='Approved'",[relatedEndorsementId,student.id]),422,'Choose an approved endorsement for the selected pupil.')}
+  const id=await insert("INSERT INTO remedial_sessions (student_id,related_endorsement_id,teacher_id,recorded_by,session_date,start_time,end_time,focus_area,session_type,status,notes) VALUES (?,?,?,?,?,?,?,?,?,'Scheduled',?)",[student.id,relatedEndorsementId,teacherId,req.user.id,b.session_date,b.start_time,b.end_time,b.focus_area,b.session_type,b.notes||null]);res.status(201).json({data:await one('SELECT * FROM remedial_sessions WHERE id=?',[id])})
 })
 app.get('/api/attendance', async (req,res)=>{
   const teacher=req.user.role==='teacher';const base=teacher?' AND s.teacher_id=?':'';const args=teacher?[req.user.id]:[]
