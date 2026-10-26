@@ -52,6 +52,7 @@ const authCacheTtlMs = Math.max(0, Number(process.env.AUTH_CACHE_TTL_MS || 10000
 const maxCachedAuthUsers = 2000
 const authUserCache = new Map()
 let notificationTableReady
+let profileImagesTableReady
 
 async function ensureNotificationTable() {
   if (!notificationTableReady) {
@@ -73,6 +74,45 @@ async function recordNotification(message) {
     await query('INSERT INTO system_notifications (message) VALUES (?)', [message.slice(0, 255)])
   } catch (error) {
     console.warn(JSON.stringify({ event: 'notification_write_failed', message: error.message }))
+  }
+}
+
+async function ensureProfileImagesTable() {
+  if (!profileImagesTableReady) {
+    profileImagesTableReady = query(`CREATE TABLE IF NOT EXISTS profile_images (
+      owner_type VARCHAR(16) NOT NULL,
+      owner_id BIGINT UNSIGNED NOT NULL,
+      mime_type VARCHAR(64) NOT NULL,
+      image_data MEDIUMBLOB NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (owner_type, owner_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+      .catch((error) => { profileImagesTableReady = null; throw error })
+  }
+  await profileImagesTableReady
+}
+
+async function saveProfileImage(file, ownerType, ownerId) {
+  await ensureProfileImagesTable()
+  await query(`INSERT INTO profile_images (owner_type,owner_id,mime_type,image_data)
+    VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE mime_type=VALUES(mime_type),image_data=VALUES(image_data),updated_at=CURRENT_TIMESTAMP`,
+  [ownerType, ownerId, file.mimetype, file.buffer])
+  return `db-image:${ownerType}:${ownerId}`
+}
+
+async function sendProfileImage(res, ownerType, ownerId, relativePath) {
+  if (!relativePath) return res.status(204).end()
+  await ensureProfileImagesTable()
+  const stored = await one('SELECT mime_type,image_data FROM profile_images WHERE owner_type=? AND owner_id=?', [ownerType, ownerId])
+  if (stored) return res.type(stored.mime_type).set('Cache-Control', 'private, no-store').send(stored.image_data)
+  const target = filePath(relativePath)
+  assert(target.startsWith(storageRoot + path.sep), 400, 'Invalid file path.')
+  try {
+    await fs.access(target)
+    return sendFile(res, relativePath)
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+    return res.status(204).end()
   }
 }
 
@@ -567,9 +607,9 @@ app.get('/api/profile', async (req,res)=>{
 })
 app.put('/api/profile', async (req,res)=>{const b=req.body;assert(b.full_name&&b.email,422,'Name and email are required.');const dup=await one('SELECT id FROM users WHERE email=? AND id<>?',[b.email,req.user.id]);assert(!dup,422,'Email is already in use.');await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=?,contact_number=? WHERE id=?',[b.full_name,b.email,b.section||null,b.grade_level||null,b.contact_number||null,req.user.id]);invalidateUserAuth(req.user.id);res.json({message:'Profile updated successfully!',user:await one(`SELECT ${safeUserFields} FROM users WHERE id=?`,[req.user.id])})})
 app.post('/api/profile/password', async (req,res)=>{const b=req.body;assert(b.current_password&&b.new_password&&b.confirm_password,422,'Complete all password fields.');assert(b.new_password===b.confirm_password,422,'Password confirmation does not match.');const stored=await one('SELECT password FROM users WHERE id=?',[req.user.id]);const h=String(stored?.password||'').replace(/^\$2y\$/,'$2b$');assert(await bcrypt.compare(b.current_password,h),422,'Current password is incorrect.');await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash(b.new_password,10),req.user.id]);res.json({message:'Password changed successfully!'})})
-app.post('/api/profile/image', imageUpload.single('profile_image'), async (req,res)=>{assert(req.file&&/^image\/(jpeg|png|gif|webp)$/.test(req.file.mimetype),422,'Upload a JPG, PNG, GIF, or WebP image.');const f=await saveUpload(req.file,'profiles',`profile_${req.user.id}`);await query('UPDATE users SET profile_image=? WHERE id=?',[f.relative,req.user.id]);invalidateUserAuth(req.user.id);res.json({message:'Profile image updated successfully!',profile_image:f.relative})})
+app.post('/api/profile/image', imageUpload.single('profile_image'), async (req,res)=>{assert(req.file&&/^image\/(jpeg|png|gif|webp)$/.test(req.file.mimetype),422,'Upload a JPG, PNG, GIF, or WebP image.');const imagePath=await saveProfileImage(req.file,'user',req.user.id);await query('UPDATE users SET profile_image=? WHERE id=?',[imagePath,req.user.id]);invalidateUserAuth(req.user.id);res.json({message:'Profile image updated successfully!',profile_image:imagePath})})
 app.post('/api/profile/toggle-status', async (req,res)=>{requireRole(req,adminRoles);const status=req.user.status==='active'?'inactive':'active';await query('UPDATE users SET status=? WHERE id=?',[status,req.user.id]);invalidateUserAuth(req.user.id);if(status==='inactive')await query('DELETE FROM personal_access_tokens WHERE id=?',[req.apiTokenId]);res.json({message:`Account status updated to ${status}.`,status})})
-app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT profile_image FROM users WHERE id=?',[req.params.id]);assert(u?.profile_image,404,'Image not found.');sendFile(res,u.profile_image)})
+app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT profile_image FROM users WHERE id=?',[req.params.id]);assert(u,404,'User not found.');await sendProfileImage(res,'user',req.params.id,u.profile_image)})
 
 app.get('/api/teachers', async (req,res)=>{
   requireRole(req,adminRoles);let p=[];let w=" WHERE u.role='teacher'";if(req.query.search){const q=searchLike(req.query.search);w+=' AND (u.full_name LIKE ? OR u.email LIKE ? OR u.section LIKE ? OR u.grade_level LIKE ?)';p=[q,q,q,q]}
