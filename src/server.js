@@ -565,6 +565,20 @@ app.post('/api/endorsements', upload.single('supporting_document'), async (req,r
   const id=await transaction(async c=>{const [r]=await c.execute("INSERT INTO endorsements (student_id,teacher_id,assessment_tool,assessment_date,assessment_result,reading_level,reading_difficulty,teacher_remarks,supporting_document,status) VALUES (?,?,?,?,?,?,?,?,?,'Pending')",[student.id,req.user.id,b.assessment_tool,b.assessment_date||null,b.assessment_result,b.reading_level,b.reading_difficulty||'',b.teacher_remarks||'',saved?.relative||null]);await c.execute("INSERT INTO endorsement_history (endorsement_id,status,changed_by,remarks) VALUES (?,'Pending',?,'Submitted by teacher')",[r.insertId,req.user.id]);return r.insertId})
   res.status(201).json({data:await one('SELECT * FROM endorsements WHERE id=?',[id])})
 })
+app.delete('/api/endorsements/:id', async (req,res)=>{
+  requireRole(req,['teacher'])
+  const document=await transaction(async c=>{
+    const [rows]=await c.execute('SELECT status,supporting_document FROM endorsements WHERE id=? AND teacher_id=? FOR UPDATE',[req.params.id,req.user.id])
+    const endorsement=rows[0]
+    assert(endorsement,404,'Endorsement not found.')
+    assert(endorsement.status==='Pending',409,'Only pending endorsements can be deleted.')
+    await c.execute('DELETE FROM endorsement_history WHERE endorsement_id=?',[req.params.id])
+    await c.execute('DELETE FROM endorsements WHERE id=? AND teacher_id=?',[req.params.id,req.user.id])
+    return endorsement.supporting_document
+  })
+  if(document) await fs.rm(filePath(document),{force:true})
+  res.json({message:'Endorsement deleted.'})
+})
 app.get('/api/endorsements/:id/history', async (req,res)=>{
   const e=await one('SELECT teacher_id FROM endorsements WHERE id=?',[req.params.id]);assert(e,404,'Endorsement not found.');assert(adminRoles.includes(req.user.role)||Number(e.teacher_id)===Number(req.user.id),403)
   res.json({data:await query('SELECT h.*,u.full_name changed_by_name FROM endorsement_history h JOIN users u ON u.id=h.changed_by WHERE h.endorsement_id=? ORDER BY h.created_at,h.id',[req.params.id])})
