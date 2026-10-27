@@ -352,7 +352,7 @@ app.post('/api/students', imageUpload.single('profile_image'), async (req, res) 
   assert(/^\d{12}$/.test(String(body.lrn)), 422, 'LRN must contain exactly 12 digits.')
   if (await one('SELECT id FROM students WHERE lrn = ?', [body.lrn])) fail(422, 'The LRN has already been taken.')
   let teacherId = body.teacher_id || null
-  if (teacherId) assert(await one("SELECT id FROM users WHERE id=? AND role='teacher' AND status='active'", [teacherId]), 422, 'Select an active teacher.')
+  if (teacherId) {const teacher=await one("SELECT id,grade_level,section FROM users WHERE id=? AND role='teacher' AND status='active'",[teacherId]);assert(teacher,422,'Select an active teacher.');assert(teacher.grade_level===body.grade_level&&teacher.section===body.section,422,'The assigned teacher must match the pupil’s grade and section.')}
   let imagePath = null
   if (req.file) imagePath = (await saveUpload(req.file, 'students', 'student')).relative
   const id = await insert('INSERT INTO students (lrn,full_name,section,grade_level,teacher_id,date_enrolled,parent_guardian,contact_number,profile_image) VALUES (?,?,?,?,?,?,?,?,?)', [body.lrn, body.full_name, body.section, body.grade_level, teacherId, body.date_enrolled || new Date().toISOString().slice(0, 10), body.parent_guardian || null, body.contact_number || null, imagePath])
@@ -393,7 +393,7 @@ app.put('/api/students/:id', imageUpload.single('profile_image'), async (req, re
   assert(/^\d{12}$/.test(String(data.lrn)), 422, 'LRN must contain exactly 12 digits.')
   const duplicate = await one('SELECT id FROM students WHERE lrn=? AND id<>?', [data.lrn, req.params.id])
   assert(!duplicate, 422, 'The LRN has already been taken.')
-  assert(await one("SELECT id FROM users WHERE id=? AND role='teacher' AND status='active'", [data.teacher_id]), 422, 'Select an active teacher.')
+  const assignedTeacher=await one("SELECT id,grade_level,section FROM users WHERE id=? AND role='teacher' AND status='active'",[data.teacher_id]);assert(assignedTeacher,422,'Select an active teacher.');assert(assignedTeacher.grade_level===data.grade_level&&assignedTeacher.section===data.section,422,'The assigned teacher must match the pupil’s grade and section.')
   const profileImage = req.file ? (await saveUpload(req.file, 'students', 'student')).relative : null
   await query('UPDATE students SET full_name=?,lrn=?,section=?,grade_level=?,date_enrolled=?,parent_guardian=?,contact_number=?,teacher_id=?,profile_image=COALESCE(?,profile_image) WHERE id=?', [...fields.map((key) => data[key] ?? null), profileImage, req.params.id])
   const row = await one('SELECT * FROM students WHERE id=?', [req.params.id]); assert(row, 404, 'Pupil not found.')
@@ -412,13 +412,13 @@ app.get('/api/dashboard', async (req, res) => {
   const studentScope = teacher ? 's.teacher_id=? AND ' : ''
   const metricsSql = `SELECT sm.students,sm.independent,sm.instructional,sm.frustration,
     (SELECT COUNT(*) FROM assessments a JOIN students s ON s.id=a.student_id WHERE ${studentScope}1=1) AS assessments,
-    (SELECT COUNT(*) FROM endorsements WHERE status='Pending'${teacher ? ' AND teacher_id=?' : ''}) AS pending_endorsements,
+    (SELECT COUNT(*) FROM endorsements e JOIN students s ON s.id=e.student_id WHERE e.status='Pending'${teacher ? ' AND s.teacher_id=?' : ''}) AS pending_endorsements,
     (SELECT COUNT(*) FROM remedial_sessions rs JOIN students s ON s.id=rs.student_id WHERE ${studentScope}1=1) AS remedial_sessions,
     (SELECT COUNT(DISTINCT s.id) FROM students s JOIN remedial_sessions rs ON rs.student_id=s.id WHERE ${studentScope}rs.status IN ('Scheduled','In Progress')) AS remedial_pupils,
     ${teacher ? '0' : "(SELECT COUNT(*) FROM users WHERE role='teacher' AND status='active')"} AS teachers,
     attendance.present_attendance,attendance.absent_attendance
     FROM (SELECT COUNT(*) students,COALESCE(SUM(reading_profile='Independent'),0) independent,COALESCE(SUM(reading_profile='Instructional'),0) instructional,COALESCE(SUM(reading_profile='Frustration'),0) frustration FROM students${scope}) sm
-    CROSS JOIN (SELECT COALESCE(SUM(ra.status='Present'),0) present_attendance,COALESCE(SUM(ra.status='Absent'),0) absent_attendance FROM remedial_attendance ra${teacher ? ' JOIN remedial_sessions rs ON rs.id=ra.session_id WHERE rs.teacher_id=?' : ''}) attendance`
+    CROSS JOIN (SELECT COALESCE(SUM(ra.status='Present'),0) present_attendance,COALESCE(SUM(ra.status='Absent'),0) absent_attendance FROM remedial_attendance ra JOIN students attendance_student ON attendance_student.id=ra.student_id${teacher ? ' WHERE attendance_student.teacher_id=?' : ''}) attendance`
   const metricsParams = [
     ...scopeParams,
     ...scopeParams,
@@ -434,7 +434,7 @@ app.get('/api/dashboard', async (req, res) => {
     query(`SELECT id,full_name,grade_level,section,reading_profile,score FROM students${scope}${teacher ? ' AND' : ' WHERE'} reading_profile IN ('Frustration','Low Emerging Reader') ORDER BY full_name LIMIT 5`, scopeParams),
     query(`SELECT pu.id,pu.student_id,pu.previous_profile,pu.current_profile,pu.trend,pu.update_date,s.full_name,s.grade_level,s.section FROM progress_updates pu JOIN students s ON s.id=pu.student_id WHERE ${studentScope}1=1 ORDER BY pu.update_date DESC LIMIT 6`, scopeParams),
     query(`SELECT rs.id,rs.session_date,rs.start_time,rs.session_type,rs.status,s.full_name,s.grade_level,s.section FROM remedial_sessions rs JOIN students s ON s.id=rs.student_id WHERE ${studentScope}rs.session_date>=CURDATE() ORDER BY rs.session_date,rs.start_time LIMIT 5`, scopeParams),
-    query(`SELECT lm.title,lm.material_type,md.given_to,md.grade_level,md.date_given,u.full_name given_by_name FROM material_distribution md JOIN learning_materials lm ON lm.id=md.material_id LEFT JOIN users u ON u.id=md.given_by LEFT JOIN students s ON s.full_name=md.given_to WHERE ${teacher ? '(md.given_by=? OR s.teacher_id=?) AND ' : ''}1=1 ORDER BY md.date_given DESC LIMIT 6`, teacher ? [req.user.id, req.user.id] : []),
+    query(`SELECT lm.title,lm.material_type,md.given_to,md.grade_level,md.date_given,u.full_name given_by_name FROM material_distribution md JOIN learning_materials lm ON lm.id=md.material_id LEFT JOIN users u ON u.id=md.given_by LEFT JOIN students s ON s.full_name=md.given_to WHERE ${teacher ? 's.teacher_id=? AND ' : ''}1=1 ORDER BY md.date_given DESC LIMIT 6`, teacher ? [req.user.id] : []),
   ])
   const present = Number(metrics.present_attendance || 0), absent = Number(metrics.absent_attendance || 0)
   res.json({ role: req.user.role, metrics: { students: Number(metrics.students), teachers: Number(metrics.teachers), assessments: Number(metrics.assessments), pending_endorsements: Number(metrics.pending_endorsements), remedial_sessions: Number(metrics.remedial_sessions), independent: Number(metrics.independent), instructional: Number(metrics.instructional), frustration: Number(metrics.frustration), remedial_pupils: Number(metrics.remedial_pupils), present_attendance: present, absent_attendance: absent, attendance_rate: present + absent ? Math.round(present / (present + absent) * 100) : 0 }, recent_assessments: recentAssessments, students_needing_support: support, intervention_pupils: support.filter((s) => s.reading_profile === 'Frustration'), student_overview: [], level_distribution: { independent: Number(metrics.independent), instructional: Number(metrics.instructional), frustration: Number(metrics.frustration) }, grade_distribution: grades, recent_progress: progress, upcoming_sessions: upcoming, material_history: materials })
@@ -573,13 +573,13 @@ app.post('/api/attendance', async (req,res)=>{
 
 app.get('/api/endorsements', async (req,res)=>{
   const reviewer=adminRoles.includes(req.user.role);const p=[];let w=' WHERE 1=1'
-  if(!reviewer){w+=' AND e.teacher_id=?';p.push(req.user.id)}
+  if(!reviewer){w+=' AND s.teacher_id=?';p.push(req.user.id)}
   if(req.query.status&&req.query.status!=='All'){w+=' AND e.status=?';p.push(req.query.status)}
   if(req.query.search){const q=searchLike(req.query.search);w+=' AND (s.full_name LIKE ? OR s.grade_level LIKE ? OR t.full_name LIKE ? OR e.assessment_tool LIKE ? OR e.reading_level LIKE ?)';p.push(q,q,q,q,q)}
   const sql=`SELECT e.*,s.full_name,s.grade_level,s.section,t.full_name teacher_name FROM endorsements e JOIN students s ON s.id=e.student_id JOIN users t ON t.id=e.teacher_id${w} ORDER BY FIELD(e.status,'Pending','Returned for Revision','Approved','Rejected'),e.created_at DESC,e.id DESC`
   const countSql=`SELECT COUNT(*) AS total FROM endorsements e JOIN students s ON s.id=e.student_id JOIN users t ON t.id=e.teacher_id${w}`
   const page=await paginated(req,sql,p,countSql);const data=page?.data||await query(sql,p)
-  const countRows=await query(`SELECT status,COUNT(*) total FROM endorsements${reviewer?'':' WHERE teacher_id=?'} GROUP BY status`,reviewer?[]:[req.user.id]);const counts={All:0,Pending:0,Approved:0,'Returned for Revision':0,Rejected:0};for(const c of countRows){counts[c.status]=Number(c.total);counts.All+=Number(c.total)}
+  const countRows=await query(`SELECT e.status,COUNT(*) total FROM endorsements e JOIN students s ON s.id=e.student_id${reviewer?'':' WHERE s.teacher_id=?'} GROUP BY e.status`,reviewer?[]:[req.user.id]);const counts={All:0,Pending:0,Approved:0,'Returned for Revision':0,Rejected:0};for(const c of countRows){counts[c.status]=Number(c.total);counts.All+=Number(c.total)}
   res.json({data,counts,students:reviewer?[]:await query('SELECT id,full_name,grade_level,section FROM students WHERE teacher_id=? ORDER BY full_name',[req.user.id]),reviewer,...(page?{pagination:page.pagination}:{})})
 })
 app.post('/api/endorsements', upload.single('supporting_document'), async (req,res)=>{
@@ -592,27 +592,27 @@ app.post('/api/endorsements', upload.single('supporting_document'), async (req,r
 app.delete('/api/endorsements/:id', async (req,res)=>{
   requireRole(req,['teacher'])
   const document=await transaction(async c=>{
-    const [rows]=await c.execute('SELECT status,supporting_document FROM endorsements WHERE id=? AND teacher_id=? FOR UPDATE',[req.params.id,req.user.id])
+    const [rows]=await c.execute('SELECT e.status,e.supporting_document FROM endorsements e JOIN students s ON s.id=e.student_id WHERE e.id=? AND s.teacher_id=? FOR UPDATE',[req.params.id,req.user.id])
     const endorsement=rows[0]
     assert(endorsement,404,'Endorsement not found.')
     assert(endorsement.status==='Pending',409,'Only pending endorsements can be deleted.')
     await c.execute('DELETE FROM endorsement_history WHERE endorsement_id=?',[req.params.id])
-    await c.execute('DELETE FROM endorsements WHERE id=? AND teacher_id=?',[req.params.id,req.user.id])
+    await c.execute('DELETE FROM endorsements WHERE id=?',[req.params.id])
     return endorsement.supporting_document
   })
   if(document) await fs.rm(filePath(document),{force:true})
   res.json({message:'Endorsement deleted.'})
 })
 app.get('/api/endorsements/:id/history', async (req,res)=>{
-  const e=await one('SELECT teacher_id FROM endorsements WHERE id=?',[req.params.id]);assert(e,404,'Endorsement not found.');assert(adminRoles.includes(req.user.role)||Number(e.teacher_id)===Number(req.user.id),403)
+  const e=await one('SELECT s.teacher_id FROM endorsements e JOIN students s ON s.id=e.student_id WHERE e.id=?',[req.params.id]);assert(e,404,'Endorsement not found.');assert(adminRoles.includes(req.user.role)||Number(e.teacher_id)===Number(req.user.id),403)
   res.json({data:await query('SELECT h.*,u.full_name changed_by_name FROM endorsement_history h JOIN users u ON u.id=h.changed_by WHERE h.endorsement_id=? ORDER BY h.created_at,h.id',[req.params.id])})
 })
-app.get('/api/endorsements/:id/document', async (req,res)=>{const e=await one('SELECT teacher_id,supporting_document FROM endorsements WHERE id=?',[req.params.id]);assert(e,404,'Endorsement not found.');assert(adminRoles.includes(req.user.role)||Number(e.teacher_id)===Number(req.user.id),403);assert(e.supporting_document,404,'Document not found.');sendFile(res,e.supporting_document,true)})
+app.get('/api/endorsements/:id/document', async (req,res)=>{const e=await one('SELECT s.teacher_id,e.supporting_document FROM endorsements e JOIN students s ON s.id=e.student_id WHERE e.id=?',[req.params.id]);assert(e,404,'Endorsement not found.');assert(adminRoles.includes(req.user.role)||Number(e.teacher_id)===Number(req.user.id),403);assert(e.supporting_document,404,'Document not found.');sendFile(res,e.supporting_document,true)})
 app.post('/api/endorsements/:id/review', async (req,res)=>{
   requireRole(req,adminRoles);const b=req.body;assert(['Approved','Returned for Revision','Rejected'].includes(b.status),422,'Choose a valid review status.')
   await transaction(async c=>{const [rows]=await c.execute('SELECT status FROM endorsements WHERE id=? FOR UPDATE',[req.params.id]);const endorsement=rows[0];assert(endorsement,404,'Endorsement not found.');assert(['Pending','Returned for Revision'].includes(endorsement.status),409,'This endorsement has already been reviewed.');await c.execute('UPDATE endorsements SET status=?,reviewed_by=?,reviewed_at=NOW() WHERE id=?',[b.status,req.user.id,req.params.id]);await c.execute('INSERT INTO endorsement_history (endorsement_id,status,changed_by,remarks) VALUES (?,?,?,?)',[req.params.id,b.status,req.user.id,b.review_remarks||''])});res.json({message:'Endorsement status updated.'})
 })
-app.get('/api/endorsements/:id', async (req,res)=>{const reviewer=adminRoles.includes(req.user.role);const e=await one('SELECT e.*,s.full_name,s.lrn,s.grade_level,s.section,t.full_name teacher_name,v.full_name reviewer_name FROM endorsements e JOIN students s ON s.id=e.student_id JOIN users t ON t.id=e.teacher_id LEFT JOIN users v ON v.id=e.reviewed_by WHERE e.id=? AND (?=1 OR e.teacher_id=?)',[req.params.id,reviewer?1:0,req.user.id]);assert(e,404,'Endorsement not found.');res.json({data:e,reviewer})})
+app.get('/api/endorsements/:id', async (req,res)=>{const reviewer=adminRoles.includes(req.user.role);const e=await one('SELECT e.*,s.full_name,s.lrn,s.grade_level,s.section,t.full_name teacher_name,v.full_name reviewer_name FROM endorsements e JOIN students s ON s.id=e.student_id JOIN users t ON t.id=e.teacher_id LEFT JOIN users v ON v.id=e.reviewed_by WHERE e.id=? AND (?=1 OR s.teacher_id=?)',[req.params.id,reviewer?1:0,req.user.id]);assert(e,404,'Endorsement not found.');res.json({data:e,reviewer})})
 
 app.get('/api/materials', async (req,res)=>{
   const p=[];let w=' WHERE 1=1';if(req.query.search){const q=searchLike(req.query.search);w+=' AND (m.title LIKE ? OR m.material_type LIKE ? OR m.skill_focus LIKE ? OR m.description LIKE ?)';p.push(q,q,q,q)}
@@ -633,7 +633,7 @@ app.delete('/api/materials/:id', async (req,res)=>{requireRole(req,adminRoles);c
 
 app.get('/api/profile', async (req,res)=>{
   const isTeacher=req.user.role==='teacher';let stats
-  if(isTeacher){const [students,sessions,assessments]=await Promise.all([one('SELECT COUNT(*) n FROM students WHERE teacher_id=?',[req.user.id]),one('SELECT COUNT(*) n FROM remedial_sessions WHERE teacher_id=?',[req.user.id]),one('SELECT COUNT(*) n FROM assessments a JOIN students s ON s.id=a.student_id WHERE s.teacher_id=?',[req.user.id])]);stats={total_students:Number(students.n),sessions:Number(sessions.n),assessments:Number(assessments.n)}}
+  if(isTeacher){const [students,sessions,assessments]=await Promise.all([one('SELECT COUNT(*) n FROM students WHERE teacher_id=?',[req.user.id]),one('SELECT COUNT(*) n FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE s.teacher_id=?',[req.user.id]),one('SELECT COUNT(*) n FROM assessments a JOIN students s ON s.id=a.student_id WHERE s.teacher_id=?',[req.user.id])]);stats={total_students:Number(students.n),sessions:Number(sessions.n),assessments:Number(assessments.n)}}
   else {const [teachers,students,reports]=await Promise.all([one("SELECT COUNT(*) n FROM users WHERE role='teacher'"),one('SELECT COUNT(*) n FROM students'),one('SELECT COUNT(*) n FROM reports')]);stats={total_teachers:Number(teachers.n),total_students:Number(students.n),total_reports:Number(reports.n)}}
   res.json({user:Object.fromEntries(Object.entries(req.user).filter(([k])=>safeUserFields.split(', ').includes(k))),stats})
 })
@@ -697,13 +697,31 @@ app.post('/api/users', async (req,res)=>{
 })
 app.put('/api/users/:id', async (req,res)=>{
   requireRole(req,['coordinator'])
-  const target=await one("SELECT id,role FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
+  const target=await one("SELECT id,role,grade_level,section FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
   const b=req.body;const fullName=String(b.full_name||'').trim();const email=String(b.email||'').trim();const gradeLevel=String(b.grade_level||'').trim();const section=String(b.section||'').trim();const errors={}
   if(!fullName)errors.full_name=['Name is required.'];if(!/^\S+@\S+\.\S+$/.test(email))errors.email=['Enter a valid login email.'];if(target.role==='teacher'&&!gradeLevel)errors.grade_level=['Assigned grade is required for teachers.'];if(target.role==='teacher'&&!section)errors.section=['Assigned section is required for teachers.']
   if(Object.keys(errors).length)fail(422,'Review the required account details.',errors)
   if(await one('SELECT id FROM users WHERE email=? AND id<>? LIMIT 1',[email,target.id]))fail(422,'This username or email is already in use.',{email:['This username or email is already in use.']})
-  await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=? WHERE id=?',[fullName,email,target.role==='teacher'?section:null,target.role==='teacher'?gradeLevel:null,target.id])
-  res.json({message:'User account updated.'})
+  const hasAssignments=target.role==='teacher'&&Array.isArray(b.student_ids);const studentIds=hasAssignments?[...new Set(b.student_ids.map(String))]:[]
+  if(studentIds.some((id)=>!/^\d+$/.test(id)))fail(422,'Select valid pupils.',{student_ids:['Select valid pupils.']})
+  const currentAssigned=target.role==='teacher'?await query('SELECT id,grade_level,section FROM students WHERE teacher_id=?',[target.id]):[]
+  if(hasAssignments&&studentIds.length){const placeholders=studentIds.map(()=>'?').join(',');const assigned=await query(`SELECT id,teacher_id,grade_level,section FROM students WHERE id IN (${placeholders}) AND (teacher_id IS NULL OR teacher_id=?)`,[...studentIds.map(Number),target.id]);if(assigned.length!==studentIds.length)fail(409,'A selected pupil is assigned to another teacher. Refresh the pupil list and try again.');if(assigned.some((student)=>student.grade_level!==gradeLevel||student.section!==section))fail(422,'Assigned pupils must match the teacher’s selected grade and section.')}
+  const expectedIds=hasAssignments?studentIds.map(Number):currentAssigned.filter((student)=>student.grade_level===gradeLevel&&student.section===section).map((student)=>Number(student.id))
+  const currentIds=currentAssigned.map((student)=>Number(student.id)).sort((a,b)=>a-b);const nextIds=expectedIds.slice().sort((a,b)=>a-b)
+  const assignmentChanged=target.role==='teacher'&&(target.grade_level!==gradeLevel||target.section!==section||currentIds.length!==nextIds.length||currentIds.some((id,index)=>id!==nextIds[index]))
+  const expiredReportPaths=await transaction(async(connection)=>{
+    let paths=[]
+    if(hasAssignments&&studentIds.length){const placeholders=studentIds.map(()=>'?').join(',');const [locked]=await connection.execute(`SELECT id,teacher_id,grade_level,section FROM students WHERE id IN (${placeholders}) AND (teacher_id IS NULL OR teacher_id=?) FOR UPDATE`,[...studentIds.map(Number),target.id]);assert(locked.length===studentIds.length,409,'A selected pupil was assigned to another teacher. Refresh and try again.');assert(!locked.some((student)=>student.grade_level!==gradeLevel||student.section!==section),422,'Assigned pupils must match the teacher’s selected grade and section.')}
+    await connection.execute('UPDATE users SET full_name=?,email=?,section=?,grade_level=? WHERE id=?',[fullName,email,target.role==='teacher'?section:null,target.role==='teacher'?gradeLevel:null,target.id])
+    if(target.role==='teacher'){
+      if(hasAssignments){await connection.execute('UPDATE students SET teacher_id=NULL WHERE teacher_id=?',[target.id]);for(const studentId of studentIds){const [updated]=await connection.execute('UPDATE students SET teacher_id=? WHERE id=? AND teacher_id IS NULL',[target.id,Number(studentId)]);assert(updated.affectedRows===1,409,'A selected pupil was assigned to another teacher. Refresh and try again.')}}
+      else await connection.execute('UPDATE students SET teacher_id=NULL WHERE teacher_id=? AND (grade_level<>? OR section<>?)',[target.id,gradeLevel,section])
+    }
+    if(assignmentChanged){const [reports]=await connection.execute("SELECT file_path FROM reports WHERE generated_by=? AND report_type IN ('progress','attendance') AND file_path IS NOT NULL FOR UPDATE",[target.id]);paths=reports.map((report)=>report.file_path);await connection.execute("UPDATE reports SET file_path=NULL WHERE generated_by=? AND report_type IN ('progress','attendance')",[target.id])}
+    return paths
+  })
+  for(const reportPath of expiredReportPaths){try{await fs.rm(filePath(reportPath),{force:true})}catch(error){console.warn(JSON.stringify({event:'report_scope_cleanup_failed',user_id:target.id,message:error.message}))}}
+  res.json({message:assignmentChanged?'Teacher account and pupil access updated. Previous progress and attendance exports expired; regenerate them for the updated pupil scope.':'User account updated.'})
 })
 app.post('/api/users/:id/:action', async (req,res)=>{
   requireRole(req,['coordinator'])
@@ -723,7 +741,7 @@ app.get('/api/teachers', async (req,res)=>{
 app.get('/api/teachers/principal', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id,full_name,email,status,joined_date FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');res.json({data:p})})
 app.put('/api/teachers/principal', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');await query('UPDATE users SET full_name=?,email=? WHERE id=?',[req.body.full_name,req.body.email,p.id]);res.json({message:'Principal account updated.'})})
 app.post('/api/teachers/principal/:action', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id,status FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');if(req.params.action==='toggle'){await query('UPDATE users SET status=? WHERE id=?',[p.status==='active'?'inactive':'active',p.id]);invalidateUserAuth(p.id)}else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),p.id]);else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Principal account reset. Temporary password: password':'Principal account status updated.'})})
-app.get('/api/teachers/:id/profile', async (req,res)=>{assert(adminRoles.includes(req.user.role)||Number(req.user.id)===Number(req.params.id),403);const teacher=await one("SELECT id,full_name,email,section,grade_level,status,joined_date,profile_image FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');const [students,assessments,sessions]=await Promise.all([query('SELECT * FROM students WHERE teacher_id=? ORDER BY full_name',[req.params.id]),query('SELECT a.*,s.full_name FROM assessments a JOIN students s ON s.id=a.student_id WHERE s.teacher_id=? ORDER BY a.assessment_date DESC LIMIT 20',[req.params.id]),query('SELECT * FROM remedial_sessions WHERE teacher_id=? ORDER BY session_date DESC LIMIT 20',[req.params.id])]);res.json({teacher,students,assessments,sessions})})
+app.get('/api/teachers/:id/profile', async (req,res)=>{assert(adminRoles.includes(req.user.role)||Number(req.user.id)===Number(req.params.id),403);const teacher=await one("SELECT id,full_name,email,section,grade_level,status,joined_date,profile_image FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');const [students,assessments,sessions]=await Promise.all([query('SELECT * FROM students WHERE teacher_id=? ORDER BY full_name',[req.params.id]),query('SELECT a.*,s.full_name FROM assessments a JOIN students s ON s.id=a.student_id WHERE s.teacher_id=? ORDER BY a.assessment_date DESC LIMIT 20',[req.params.id]),query('SELECT r.* FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE s.teacher_id=? ORDER BY r.session_date DESC LIMIT 20',[req.params.id])]);res.json({teacher,students,assessments,sessions})})
 app.post('/api/teachers', async (req,res)=>{requireRole(req,adminRoles);const b=req.body;assert(b.full_name&&b.email,422,'Name and email are required.');assert(!await one('SELECT id FROM users WHERE email=?',[b.email]),422,'Email is already in use.');const id=await insert("INSERT INTO users (full_name,email,section,grade_level,password,role,status,joined_date) VALUES (?,?,?,? ,?,'teacher','active',CURDATE())",[b.full_name,b.email,b.section||null,b.grade_level||null,await bcrypt.hash('password',10)]);res.status(201).json({message:'Teacher account created successfully!',id,temporary_password:'password'})})
 app.put('/api/teachers/:id', async (req,res)=>{requireRole(req,adminRoles);const b=req.body;const teacher=await one("SELECT id FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');assert(!await one('SELECT id FROM users WHERE email=? AND id<>?',[b.email,req.params.id]),422,'Email is already in use.');await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=? WHERE id=?',[b.full_name,b.email,b.section||null,b.grade_level||null,req.params.id]);res.json({message:'Teacher profile updated.'})})
 app.post('/api/teachers/:id/:action', async (req,res)=>{requireRole(req,adminRoles);const teacher=await one("SELECT id,status FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');if(req.params.action==='toggle'){await query('UPDATE users SET status=? WHERE id=?',[teacher.status==='active'?'inactive':'active',teacher.id]);invalidateUserAuth(teacher.id)}else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),teacher.id]);else if(req.params.action==='delete'){await query('DELETE FROM users WHERE id=?',[teacher.id]);invalidateUserAuth(teacher.id)}else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Teacher account reset. Temporary password: password':'Teacher account updated.'})})
