@@ -322,7 +322,7 @@ app.get('/api/students', async (req, res) => {
   if (req.query.options === '1' || req.query.options === 'true') {
     const params = req.user.role === 'teacher' ? [req.user.id] : []
     const where = req.user.role === 'teacher' ? ' WHERE teacher_id = ?' : ''
-    return res.json({ data: await query(`SELECT id,full_name,grade_level,section FROM students${where} ORDER BY grade_level,section,full_name`, params) })
+    return res.json({ data: await query(`SELECT id,full_name,grade_level,section,teacher_id FROM students${where} ORDER BY grade_level,section,full_name`, params) })
   }
   const params = []
   let where = ' WHERE 1=1'
@@ -668,7 +668,32 @@ app.get('/api/users', async (req,res)=>{
   if(['active','inactive'].includes(req.query.status)){where+=' AND status=?';params.push(req.query.status)}
   const sql=`SELECT id,full_name,email,role,section,grade_level,status,joined_date FROM users${where} ORDER BY CASE role WHEN 'principal' THEN 0 ELSE 1 END,full_name,id`
   const page=await paginated(req,sql,params,`SELECT COUNT(*) AS total FROM users${where}`)
-  res.json(page||{data:await query(sql,params)})
+  const principalExists=Boolean(await one("SELECT id FROM users WHERE role='principal' LIMIT 1"))
+  res.json({...page,...(!page?{data:await query(sql,params)}:{}),principal_exists:principalExists})
+})
+app.post('/api/users', async (req,res)=>{
+  requireRole(req,['coordinator'])
+  const b=req.body;const fullName=String(b.full_name||'').trim();const email=String(b.email||'').trim();const role=String(b.role||'').trim();const gradeLevel=String(b.grade_level||'').trim();const section=String(b.section||'').trim()
+  const errors={}
+  if(!fullName)errors.full_name=['Name is required.']
+  if(!/^\S+@\S+\.\S+$/.test(email))errors.email=['Enter a valid login email.']
+  if(!['teacher','principal'].includes(role))errors.role=['Select an approved account role.']
+  if(role==='teacher'&&!gradeLevel)errors.grade_level=['Assigned grade is required for teachers.']
+  if(role==='teacher'&&!section)errors.section=['Assigned section is required for teachers.']
+  const studentIds=[...new Set((Array.isArray(b.student_ids)?b.student_ids:[]).map((id)=>String(id)))];
+  if(role!=='teacher'&&studentIds.length)errors.student_ids=['Only teacher accounts can be assigned pupils.']
+  if(studentIds.some((id)=>!/^\d+$/.test(id)))errors.student_ids=['Select valid pupils.']
+  if(Object.keys(errors).length)fail(422,'Review the required account details.',errors)
+  if(await one('SELECT id FROM users WHERE email=? LIMIT 1',[email]))fail(422,'This username or email is already in use.',{email:['This username or email is already in use.']})
+  if(role==='principal'&&await one("SELECT id FROM users WHERE role='principal' LIMIT 1"))fail(409,'A principal account already exists. Edit the existing principal account instead.')
+  if(studentIds.length){const placeholders=studentIds.map(()=>'?').join(',');const available=await query(`SELECT id,grade_level,section FROM students WHERE teacher_id IS NULL AND id IN (${placeholders})`,studentIds.map(Number));if(available.length!==studentIds.length)fail(409,'One or more selected pupils are already assigned to a teacher. Refresh the pupil list and try again.');if(available.some((student)=>student.grade_level!==gradeLevel||student.section!==section))fail(422,'Assigned pupils must match the teacher’s selected grade and section.')}
+  const temporaryPassword=crypto.randomBytes(9).toString('base64url')
+  const id=await transaction(async(connection)=>{
+    const [inserted]=await connection.execute('INSERT INTO users (full_name,email,section,grade_level,password,role,status,joined_date) VALUES (?,?,?,?,?,? ,\'active\',CURDATE())',[fullName,email,role==='teacher'?section:null,role==='teacher'?gradeLevel:null,await bcrypt.hash(temporaryPassword,10),role])
+    for(const studentId of studentIds){const [updated]=await connection.execute('UPDATE students SET teacher_id=? WHERE id=? AND teacher_id IS NULL',[inserted.insertId,Number(studentId)]);assert(updated.affectedRows===1,409,'A selected pupil was assigned to another teacher. Refresh and try again.')}
+    return inserted.insertId
+  })
+  res.status(201).json({message:`${role==='principal'?'Principal':'Teacher'} account created successfully.`,id,temporary_password:temporaryPassword})
 })
 
 app.get('/api/teachers', async (req,res)=>{
