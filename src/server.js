@@ -662,9 +662,9 @@ app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT prof
 
 app.get('/api/users', async (req,res)=>{
   requireRole(req,['coordinator'])
-  const params=[];let where=" WHERE role IN ('teacher','principal')"
+  const params=[req.user.id];let where=" WHERE role IN ('teacher','principal','coordinator') AND id<>?"
   if(req.query.search){const term=searchLike(req.query.search);where+=' AND (full_name LIKE ? OR email LIKE ? OR section LIKE ? OR grade_level LIKE ?)';params.push(term,term,term,term)}
-  if(['teacher','principal'].includes(req.query.role)){where+=' AND role=?';params.push(req.query.role)}
+  if(['teacher','principal','coordinator'].includes(req.query.role)){where+=' AND role=?';params.push(req.query.role)}
   if(['active','inactive'].includes(req.query.status)){where+=' AND status=?';params.push(req.query.status)}
   const sql=`SELECT id,full_name,email,role,section,grade_level,status,joined_date FROM users${where} ORDER BY CASE role WHEN 'principal' THEN 0 ELSE 1 END,full_name,id`
   const page=await paginated(req,sql,params,`SELECT COUNT(*) AS total FROM users${where}`)
@@ -677,7 +677,7 @@ app.post('/api/users', async (req,res)=>{
   const errors={}
   if(!fullName)errors.full_name=['Name is required.']
   if(!/^\S+@\S+\.\S+$/.test(email))errors.email=['Enter a valid login email.']
-  if(!['teacher','principal'].includes(role))errors.role=['Select an approved account role.']
+  if(!['teacher','principal','coordinator'].includes(role))errors.role=['Select an approved account role.']
   if(role==='teacher'&&!gradeLevel)errors.grade_level=['Assigned grade is required for teachers.']
   if(role==='teacher'&&!section)errors.section=['Assigned section is required for teachers.']
   const studentIds=[...new Set((Array.isArray(b.student_ids)?b.student_ids:[]).map((id)=>String(id)))];
@@ -693,7 +693,24 @@ app.post('/api/users', async (req,res)=>{
     for(const studentId of studentIds){const [updated]=await connection.execute('UPDATE students SET teacher_id=? WHERE id=? AND teacher_id IS NULL',[inserted.insertId,Number(studentId)]);assert(updated.affectedRows===1,409,'A selected pupil was assigned to another teacher. Refresh and try again.')}
     return inserted.insertId
   })
-  res.status(201).json({message:`${role==='principal'?'Principal':'Teacher'} account created successfully.`,id,temporary_password:temporaryPassword})
+  res.status(201).json({message:`${role[0].toUpperCase()+role.slice(1)} account created successfully.`,id,temporary_password:temporaryPassword})
+})
+app.put('/api/users/:id', async (req,res)=>{
+  requireRole(req,['coordinator'])
+  const target=await one("SELECT id,role FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
+  const b=req.body;const fullName=String(b.full_name||'').trim();const email=String(b.email||'').trim();const gradeLevel=String(b.grade_level||'').trim();const section=String(b.section||'').trim();const errors={}
+  if(!fullName)errors.full_name=['Name is required.'];if(!/^\S+@\S+\.\S+$/.test(email))errors.email=['Enter a valid login email.'];if(target.role==='teacher'&&!gradeLevel)errors.grade_level=['Assigned grade is required for teachers.'];if(target.role==='teacher'&&!section)errors.section=['Assigned section is required for teachers.']
+  if(Object.keys(errors).length)fail(422,'Review the required account details.',errors)
+  if(await one('SELECT id FROM users WHERE email=? AND id<>? LIMIT 1',[email,target.id]))fail(422,'This username or email is already in use.',{email:['This username or email is already in use.']})
+  await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=? WHERE id=?',[fullName,email,target.role==='teacher'?section:null,target.role==='teacher'?gradeLevel:null,target.id])
+  res.json({message:'User account updated.'})
+})
+app.post('/api/users/:id/:action', async (req,res)=>{
+  requireRole(req,['coordinator'])
+  assert(['toggle','reset-password'].includes(req.params.action),404,'Not found.')
+  const target=await one("SELECT id,status FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
+  if(req.params.action==='toggle'){const status=target.status==='active'?'inactive':'active';await query('UPDATE users SET status=? WHERE id=?',[status,target.id]);invalidateUserAuth(target.id);res.json({message:`User account ${status}.`})}
+  else{const temporaryPassword=crypto.randomBytes(9).toString('base64url');await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash(temporaryPassword,10),target.id]);invalidateUserAuth(target.id);res.json({message:'Temporary password generated.',temporary_password:temporaryPassword})}
 })
 
 app.get('/api/teachers', async (req,res)=>{
