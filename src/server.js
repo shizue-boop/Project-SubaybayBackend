@@ -660,6 +660,17 @@ app.delete('/api/profile/image', async (req,res)=>{
 app.post('/api/profile/toggle-status', async (req,res)=>{requireRole(req,adminRoles);const status=req.user.status==='active'?'inactive':'active';await query('UPDATE users SET status=? WHERE id=?',[status,req.user.id]);invalidateUserAuth(req.user.id);if(status==='inactive')await query('DELETE FROM personal_access_tokens WHERE id=?',[req.apiTokenId]);res.json({message:`Account status updated to ${status}.`,status})})
 app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT profile_image FROM users WHERE id=?',[req.params.id]);assert(u,404,'User not found.');await sendProfileImage(res,'user',req.params.id,u.profile_image)})
 
+app.get('/api/users', async (req,res)=>{
+  requireRole(req,['coordinator'])
+  const params=[];let where=" WHERE role IN ('teacher','principal')"
+  if(req.query.search){const term=searchLike(req.query.search);where+=' AND (full_name LIKE ? OR email LIKE ? OR section LIKE ? OR grade_level LIKE ?)';params.push(term,term,term,term)}
+  if(['teacher','principal'].includes(req.query.role)){where+=' AND role=?';params.push(req.query.role)}
+  if(['active','inactive'].includes(req.query.status)){where+=' AND status=?';params.push(req.query.status)}
+  const sql=`SELECT id,full_name,email,role,section,grade_level,status,joined_date FROM users${where} ORDER BY CASE role WHEN 'principal' THEN 0 ELSE 1 END,full_name,id`
+  const page=await paginated(req,sql,params,`SELECT COUNT(*) AS total FROM users${where}`)
+  res.json(page||{data:await query(sql,params)})
+})
+
 app.get('/api/teachers', async (req,res)=>{
   requireRole(req,adminRoles);let p=[];let w=" WHERE u.role='teacher'";if(req.query.search){const q=searchLike(req.query.search);w+=' AND (u.full_name LIKE ? OR u.email LIKE ? OR u.section LIKE ? OR u.grade_level LIKE ?)';p=[q,q,q,q]}
   const sql=`SELECT u.id,u.full_name,u.email,u.section,u.grade_level,u.status,u.joined_date,COUNT(s.id) student_count FROM users u LEFT JOIN students s ON s.teacher_id=u.id${w} GROUP BY u.id ORDER BY u.joined_date DESC,u.id DESC`;const countSql=`SELECT COUNT(*) AS total FROM users u${w}`
