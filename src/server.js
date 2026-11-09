@@ -260,7 +260,7 @@ app.get('/api/auth/registration-status', async (req, res) => {
 })
 
 app.post('/api/auth/register', async (req, res) => {
-  const { first_name, last_name, email, password, password_confirmation } = req.body
+  const { first_name, middle_initial, last_name, email, password, password_confirmation } = req.body
   const errors = {}
   if (!String(first_name || '').trim()) errors.first_name = ['First name is required.']
   if (!String(last_name || '').trim()) errors.last_name = ['Last name is required.']
@@ -270,7 +270,8 @@ app.post('/api/auth/register', async (req, res) => {
   if (Object.keys(errors).length) fail(422, 'The given data was invalid.', errors)
   if (await one('SELECT id FROM users WHERE email = ? LIMIT 1', [email])) fail(422, 'The email has already been taken.', { email: ['The email has already been taken.'] })
   const principalExists = Boolean(await one("SELECT id FROM users WHERE role='principal' LIMIT 1"))
-  const fullName = `${first_name.trim()} ${last_name.trim()}`
+  const normalizedMiddleInitial = String(middle_initial || '').trim().replace(/[^\p{L}]/gu, '').slice(0, 1).toUpperCase()
+  const fullName = [first_name.trim(), normalizedMiddleInitial ? `${normalizedMiddleInitial}.` : '', last_name.trim()].filter(Boolean).join(' ')
   const role = principalExists ? 'teacher' : 'principal'
   const status = principalExists ? 'inactive' : 'active'
   const id = await insert('INSERT INTO users (full_name,email,password,role,section,grade_level,status,joined_date) VALUES (?,?,?,?,NULL,NULL,?,CURDATE())', [fullName, email, await bcrypt.hash(password, 10), role, status])
