@@ -665,7 +665,7 @@ app.post('/api/profile/toggle-status', async (req,res)=>{requireRole(req,adminRo
 app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT profile_image FROM users WHERE id=?',[req.params.id]);assert(u,404,'User not found.');await sendProfileImage(res,'user',req.params.id,u.profile_image)})
 
 app.get('/api/users', async (req,res)=>{
-  requireRole(req,['principal'])
+  requireRole(req,adminRoles)
   const params=[req.user.id];let where=" WHERE role IN ('teacher','coordinator') AND id<>?"
   if(req.query.search){const term=searchLike(req.query.search);where+=' AND (full_name LIKE ? OR email LIKE ? OR section LIKE ? OR grade_level LIKE ?)';params.push(term,term,term,term)}
   if(['teacher','principal','coordinator'].includes(req.query.role)){where+=' AND role=?';params.push(req.query.role)}
@@ -676,7 +676,7 @@ app.get('/api/users', async (req,res)=>{
   res.json({...page,...(!page?{data:await query(sql,params)}:{}),principal_exists:principalExists})
 })
 app.post('/api/users', async (req,res)=>{
-  requireRole(req,['principal'])
+  requireRole(req,adminRoles)
   const b=req.body;const fullName=String(b.full_name||'').trim();const email=String(b.email||'').trim();const role=String(b.role||'').trim();const gradeLevel=String(b.grade_level||'').trim();const section=String(b.section||'').trim()
   const errors={}
   if(!fullName)errors.full_name=['Name is required.']
@@ -699,7 +699,7 @@ app.post('/api/users', async (req,res)=>{
   res.status(201).json({message:`${role[0].toUpperCase()+role.slice(1)} account created successfully.`,id,temporary_password:temporaryPassword})
 })
 app.put('/api/users/:id', async (req,res)=>{
-  requireRole(req,['principal'])
+  requireRole(req,adminRoles)
   const target=await one("SELECT id,role,status,grade_level,section FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
   const b=req.body;const fullName=String(b.full_name||'').trim();const email=String(b.email||'').trim();const role=String(b.role||target.role).trim();const gradeLevel=String(b.grade_level||'').trim();const section=String(b.section||'').trim();const errors={}
   if(!fullName)errors.full_name=['Name is required.'];if(!/^\S+@\S+\.\S+$/.test(email))errors.email=['Enter a valid login email.'];if(!['teacher','coordinator'].includes(role))errors.role=['Choose Teacher or Reading Coordinator.'];if(role==='teacher'&&!gradeLevel)errors.grade_level=['Assigned grade is required for teachers.'];if(role==='teacher'&&!section)errors.section=['Assigned section is required for teachers.']
@@ -733,7 +733,7 @@ app.put('/api/users/:id', async (req,res)=>{
 })
 
 app.post('/api/users/:id/:action', async (req,res)=>{
-  requireRole(req,['principal'])
+  requireRole(req,adminRoles)
   assert(['toggle','reset-password'].includes(req.params.action),404,'Not found.')
   const target=await one("SELECT id,status FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
   if(req.params.action==='toggle'){const status=target.status==='active'?'inactive':'active';await query('UPDATE users SET status=? WHERE id=?',[status,target.id]);invalidateUserAuth(target.id);res.json({message:`User account ${status}.`})}
