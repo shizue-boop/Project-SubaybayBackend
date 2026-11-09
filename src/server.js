@@ -298,7 +298,11 @@ app.use('/api', async (req, res, next) => {
     const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase())
     const principalSelfService = ['/auth/logout', '/profile', '/profile/password', '/profile/image'].includes(req.path)
     const reportGeneration = req.path === '/reports' && req.method === 'POST'
-    if (user.role === 'principal' && isWrite && !principalSelfService && !reportGeneration) return fail(403, 'Principal accounts have view-only access.')
+    const userManagementWrite =
+      (req.path === '/users' && req.method === 'POST') ||
+      (/^\/users\/\d+$/.test(req.path) && req.method === 'PUT') ||
+      (/^\/users\/\d+\/(toggle|reset-password)$/.test(req.path) && req.method === 'POST')
+    if (user.role === 'principal' && isWrite && !principalSelfService && !reportGeneration && !userManagementWrite) return fail(403, 'Principal accounts have view-only access.')
     if (isWrite && req.path !== '/auth/logout' && req.path !== '/notifications/read') {
       const message = `${user.full_name} ${activityLabel(req)}`
       res.on('finish', () => {
