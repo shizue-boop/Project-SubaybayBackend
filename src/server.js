@@ -255,29 +255,32 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ token: `${tokenId}|${plain}`, user: userView(user) })
 })
 
+app.get('/api/auth/registration-status', async (req, res) => {
+  res.json({ principal_exists: Boolean(await one("SELECT id FROM users WHERE role='principal' LIMIT 1")) })
+})
+
 app.post('/api/auth/register', async (req, res) => {
-  const { role, first_name, last_name, grade_level, section, email, password, password_confirmation } = req.body
+  const { first_name, last_name, email, password, password_confirmation } = req.body
   const errors = {}
-  if (!['principal', 'coordinator', 'teacher'].includes(role)) errors.role = ['Select a valid role.']
   if (!String(first_name || '').trim()) errors.first_name = ['First name is required.']
   if (!String(last_name || '').trim()) errors.last_name = ['Last name is required.']
   if (!/^\S+@\S+\.\S+$/.test(String(email || ''))) errors.email = ['Enter a valid email address.']
-  if (role === 'teacher' && !grade_level) errors.grade_level = ['Grade level is required for teachers.']
-  if (role === 'teacher' && !section) errors.section = ['Section is required for teachers.']
   if (String(password || '').length < 8 || !/[A-Z]/.test(password) || !/[0-9]/.test(password)) errors.password = ['Password must have at least 8 characters, one uppercase letter, and one number.']
   if (password !== password_confirmation) errors.password_confirmation = ['Password confirmation does not match.']
   if (Object.keys(errors).length) fail(422, 'The given data was invalid.', errors)
   if (await one('SELECT id FROM users WHERE email = ? LIMIT 1', [email])) fail(422, 'The email has already been taken.', { email: ['The email has already been taken.'] })
+  const principalExists = Boolean(await one("SELECT id FROM users WHERE role='principal' LIMIT 1"))
   const fullName = `${first_name.trim()} ${last_name.trim()}`
-  const id = await insert('INSERT INTO users (full_name,email,password,role,section,grade_level,status,joined_date) VALUES (?,?,?,?,?,?,\'inactive\',CURDATE())', [fullName, email, await bcrypt.hash(password, 10), role, section || null, grade_level || null])
-  const details = { Role: role[0].toUpperCase() + role.slice(1), Name: fullName, Email: email }
-  if (role === 'teacher') details['Assigned To'] = `${grade_level || ''} — ${section || ''}`.trim()
-  await recordNotification(`${fullName} submitted an account registration`)
-  res.status(201).json({ message: 'Registration submitted successfully. Your account is pending approval.', details, id })
+  const role = principalExists ? 'teacher' : 'principal'
+  const status = principalExists ? 'inactive' : 'active'
+  const id = await insert('INSERT INTO users (full_name,email,password,role,section,grade_level,status,joined_date) VALUES (?,?,?,?,NULL,NULL,?,CURDATE())', [fullName, email, await bcrypt.hash(password, 10), role, status])
+  const details = { Role: principalExists ? 'Assigned by Principal' : 'Principal', Name: fullName, Email: email }
+  await recordNotification(principalExists ? `${fullName} submitted a staff account request` : `${fullName} set up the Principal account`)
+  res.status(201).json({ message: principalExists ? 'Registration submitted. The Principal will assign your role and activate your account.' : 'Principal account created successfully.', details, id, principal_setup: !principalExists })
 })
 
 app.use('/api', async (req, res, next) => {
-  if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/register') return next()
+  if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/register' || req.path === '/auth/registration-status') return next()
   try {
     const header = String(req.headers.authorization || '')
     const match = header.match(/^Bearer\s+(\d+)\|([a-f0-9]+)$/i)
@@ -661,8 +664,8 @@ app.post('/api/profile/toggle-status', async (req,res)=>{requireRole(req,adminRo
 app.get('/api/users/:id/image', async (req,res)=>{const u=await one('SELECT profile_image FROM users WHERE id=?',[req.params.id]);assert(u,404,'User not found.');await sendProfileImage(res,'user',req.params.id,u.profile_image)})
 
 app.get('/api/users', async (req,res)=>{
-  requireRole(req,['coordinator'])
-  const params=[req.user.id];let where=" WHERE role IN ('teacher','principal','coordinator') AND id<>?"
+  requireRole(req,['principal'])
+  const params=[req.user.id];let where=" WHERE role IN ('teacher','coordinator') AND id<>?"
   if(req.query.search){const term=searchLike(req.query.search);where+=' AND (full_name LIKE ? OR email LIKE ? OR section LIKE ? OR grade_level LIKE ?)';params.push(term,term,term,term)}
   if(['teacher','principal','coordinator'].includes(req.query.role)){where+=' AND role=?';params.push(req.query.role)}
   if(['active','inactive'].includes(req.query.status)){where+=' AND status=?';params.push(req.query.status)}
@@ -672,12 +675,12 @@ app.get('/api/users', async (req,res)=>{
   res.json({...page,...(!page?{data:await query(sql,params)}:{}),principal_exists:principalExists})
 })
 app.post('/api/users', async (req,res)=>{
-  requireRole(req,['coordinator'])
+  requireRole(req,['principal'])
   const b=req.body;const fullName=String(b.full_name||'').trim();const email=String(b.email||'').trim();const role=String(b.role||'').trim();const gradeLevel=String(b.grade_level||'').trim();const section=String(b.section||'').trim()
   const errors={}
   if(!fullName)errors.full_name=['Name is required.']
   if(!/^\S+@\S+\.\S+$/.test(email))errors.email=['Enter a valid login email.']
-  if(!['teacher','principal','coordinator'].includes(role))errors.role=['Select an approved account role.']
+  if(!['teacher','coordinator'].includes(role))errors.role=['Choose Teacher or Reading Coordinator.']
   if(role==='teacher'&&!gradeLevel)errors.grade_level=['Assigned grade is required for teachers.']
   if(role==='teacher'&&!section)errors.section=['Assigned section is required for teachers.']
   const studentIds=[...new Set((Array.isArray(b.student_ids)?b.student_ids:[]).map((id)=>String(id)))];
@@ -685,7 +688,6 @@ app.post('/api/users', async (req,res)=>{
   if(studentIds.some((id)=>!/^\d+$/.test(id)))errors.student_ids=['Select valid pupils.']
   if(Object.keys(errors).length)fail(422,'Review the required account details.',errors)
   if(await one('SELECT id FROM users WHERE email=? LIMIT 1',[email]))fail(422,'This username or email is already in use.',{email:['This username or email is already in use.']})
-  if(role==='principal'&&await one("SELECT id FROM users WHERE role='principal' LIMIT 1"))fail(409,'A principal account already exists. Edit the existing principal account instead.')
   if(studentIds.length){const placeholders=studentIds.map(()=>'?').join(',');const available=await query(`SELECT id,grade_level,section FROM students WHERE teacher_id IS NULL AND id IN (${placeholders})`,studentIds.map(Number));if(available.length!==studentIds.length)fail(409,'One or more selected pupils are already assigned to a teacher. Refresh the pupil list and try again.');if(available.some((student)=>student.grade_level!==gradeLevel||student.section!==section))fail(422,'Assigned pupils must match the teacher’s selected grade and section.')}
   const temporaryPassword=crypto.randomBytes(9).toString('base64url')
   const id=await transaction(async(connection)=>{
@@ -696,35 +698,41 @@ app.post('/api/users', async (req,res)=>{
   res.status(201).json({message:`${role[0].toUpperCase()+role.slice(1)} account created successfully.`,id,temporary_password:temporaryPassword})
 })
 app.put('/api/users/:id', async (req,res)=>{
-  requireRole(req,['coordinator'])
-  const target=await one("SELECT id,role,grade_level,section FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
-  const b=req.body;const fullName=String(b.full_name||'').trim();const email=String(b.email||'').trim();const gradeLevel=String(b.grade_level||'').trim();const section=String(b.section||'').trim();const errors={}
-  if(!fullName)errors.full_name=['Name is required.'];if(!/^\S+@\S+\.\S+$/.test(email))errors.email=['Enter a valid login email.'];if(target.role==='teacher'&&!gradeLevel)errors.grade_level=['Assigned grade is required for teachers.'];if(target.role==='teacher'&&!section)errors.section=['Assigned section is required for teachers.']
+  requireRole(req,['principal'])
+  const target=await one("SELECT id,role,status,grade_level,section FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
+  const b=req.body;const fullName=String(b.full_name||'').trim();const email=String(b.email||'').trim();const role=String(b.role||target.role).trim();const gradeLevel=String(b.grade_level||'').trim();const section=String(b.section||'').trim();const errors={}
+  if(!fullName)errors.full_name=['Name is required.'];if(!/^\S+@\S+\.\S+$/.test(email))errors.email=['Enter a valid login email.'];if(!['teacher','coordinator'].includes(role))errors.role=['Choose Teacher or Reading Coordinator.'];if(role==='teacher'&&!gradeLevel)errors.grade_level=['Assigned grade is required for teachers.'];if(role==='teacher'&&!section)errors.section=['Assigned section is required for teachers.']
+  const roleChanged=role!==target.role
+  if(roleChanged&&target.status!=='inactive')fail(409,'Deactivate the account before changing its role.')
   if(Object.keys(errors).length)fail(422,'Review the required account details.',errors)
   if(await one('SELECT id FROM users WHERE email=? AND id<>? LIMIT 1',[email,target.id]))fail(422,'This username or email is already in use.',{email:['This username or email is already in use.']})
-  const hasAssignments=target.role==='teacher'&&Array.isArray(b.student_ids);const studentIds=hasAssignments?[...new Set(b.student_ids.map(String))]:[]
-  if(studentIds.some((id)=>!/^\d+$/.test(id)))fail(422,'Select valid pupils.',{student_ids:['Select valid pupils.']})
   const currentAssigned=target.role==='teacher'?await query('SELECT id,grade_level,section FROM students WHERE teacher_id=?',[target.id]):[]
-  if(hasAssignments&&studentIds.length){const placeholders=studentIds.map(()=>'?').join(',');const assigned=await query(`SELECT id,teacher_id,grade_level,section FROM students WHERE id IN (${placeholders}) AND (teacher_id IS NULL OR teacher_id=?)`,[...studentIds.map(Number),target.id]);if(assigned.length!==studentIds.length)fail(409,'A selected pupil is assigned to another teacher. Refresh the pupil list and try again.');if(assigned.some((student)=>student.grade_level!==gradeLevel||student.section!==section))fail(422,'Assigned pupils must match the teacher’s selected grade and section.')}
-  const expectedIds=hasAssignments?studentIds.map(Number):currentAssigned.filter((student)=>student.grade_level===gradeLevel&&student.section===section).map((student)=>Number(student.id))
+  if(roleChanged&&currentAssigned.length)fail(409,'Remove this teacher?s pupil assignments before changing the role.')
+  const hasAssignments=role==='teacher'&&Array.isArray(b.student_ids);const studentIds=hasAssignments?[...new Set(b.student_ids.map(String))]:[]
+  if(studentIds.some((id)=>!/^[0-9]+$/.test(id)))fail(422,'Select valid pupils.',{student_ids:['Select valid pupils.']})
+  if(hasAssignments&&studentIds.length){const placeholders=studentIds.map(()=>'?').join(',');const assigned=await query(`SELECT id,teacher_id,grade_level,section FROM students WHERE id IN (${placeholders}) AND (teacher_id IS NULL OR teacher_id=?)`,[...studentIds.map(Number),target.id]);if(assigned.length!==studentIds.length)fail(409,'A selected pupil is assigned to another teacher. Refresh the pupil list and try again.');if(assigned.some((student)=>student.grade_level!==gradeLevel||student.section!==section))fail(422,'Assigned pupils must match the teacher?s selected grade and section.')}
+  const expectedIds=hasAssignments?studentIds.map(Number):role==='teacher'&&target.role==='teacher'?currentAssigned.filter((student)=>student.grade_level===gradeLevel&&student.section===section).map((student)=>Number(student.id)):[]
   const currentIds=currentAssigned.map((student)=>Number(student.id)).sort((a,b)=>a-b);const nextIds=expectedIds.slice().sort((a,b)=>a-b)
-  const assignmentChanged=target.role==='teacher'&&(target.grade_level!==gradeLevel||target.section!==section||currentIds.length!==nextIds.length||currentIds.some((id,index)=>id!==nextIds[index]))
+  const assignmentChanged=roleChanged||target.role==='teacher'&&(target.grade_level!==gradeLevel||target.section!==section||currentIds.length!==nextIds.length||currentIds.some((id,index)=>id!==nextIds[index]))
   const expiredReportPaths=await transaction(async(connection)=>{
     let paths=[]
-    if(hasAssignments&&studentIds.length){const placeholders=studentIds.map(()=>'?').join(',');const [locked]=await connection.execute(`SELECT id,teacher_id,grade_level,section FROM students WHERE id IN (${placeholders}) AND (teacher_id IS NULL OR teacher_id=?) FOR UPDATE`,[...studentIds.map(Number),target.id]);assert(locked.length===studentIds.length,409,'A selected pupil was assigned to another teacher. Refresh and try again.');assert(!locked.some((student)=>student.grade_level!==gradeLevel||student.section!==section),422,'Assigned pupils must match the teacher’s selected grade and section.')}
-    await connection.execute('UPDATE users SET full_name=?,email=?,section=?,grade_level=? WHERE id=?',[fullName,email,target.role==='teacher'?section:null,target.role==='teacher'?gradeLevel:null,target.id])
+    if(roleChanged&&target.role==='teacher'){const [assigned]=await connection.execute('SELECT id FROM students WHERE teacher_id=? FOR UPDATE',[target.id]);assert(!assigned.length,409,'Remove this teacher?s pupil assignments before changing the role.')}
+    if(hasAssignments&&studentIds.length){const placeholders=studentIds.map(()=>'?').join(',');const [locked]=await connection.execute(`SELECT id,teacher_id,grade_level,section FROM students WHERE id IN (${placeholders}) AND (teacher_id IS NULL OR teacher_id=?) FOR UPDATE`,[...studentIds.map(Number),target.id]);assert(locked.length===studentIds.length,409,'A selected pupil was assigned to another teacher. Refresh and try again.');assert(!locked.some((student)=>student.grade_level!==gradeLevel||student.section!==section),422,'Assigned pupils must match the teacher?s selected grade and section.')}
+    await connection.execute('UPDATE users SET full_name=?,email=?,section=?,grade_level=?,role=? WHERE id=?',[fullName,email,role==='teacher'?section:null,role==='teacher'?gradeLevel:null,role,target.id])
     if(target.role==='teacher'){
       if(hasAssignments){await connection.execute('UPDATE students SET teacher_id=NULL WHERE teacher_id=?',[target.id]);for(const studentId of studentIds){const [updated]=await connection.execute('UPDATE students SET teacher_id=? WHERE id=? AND teacher_id IS NULL',[target.id,Number(studentId)]);assert(updated.affectedRows===1,409,'A selected pupil was assigned to another teacher. Refresh and try again.')}}
-      else await connection.execute('UPDATE students SET teacher_id=NULL WHERE teacher_id=? AND (grade_level<>? OR section<>?)',[target.id,gradeLevel,section])
+      else if(role==='teacher')await connection.execute('UPDATE students SET teacher_id=NULL WHERE teacher_id=? AND (grade_level<>? OR section<>?)',[target.id,gradeLevel,section])
     }
-    if(assignmentChanged){const [reports]=await connection.execute("SELECT file_path FROM reports WHERE generated_by=? AND report_type IN ('progress','attendance') AND file_path IS NOT NULL FOR UPDATE",[target.id]);paths=reports.map((report)=>report.file_path);await connection.execute("UPDATE reports SET file_path=NULL WHERE generated_by=? AND report_type IN ('progress','attendance')",[target.id])}
+    if(assignmentChanged){const reportScope=roleChanged?' AND file_path IS NOT NULL':" AND report_type IN ('progress','attendance') AND file_path IS NOT NULL";const [reports]=await connection.execute(`SELECT file_path FROM reports WHERE generated_by=?${reportScope} FOR UPDATE`,[target.id]);paths=reports.map((report)=>report.file_path);const updateScope=roleChanged?'':" AND report_type IN ('progress','attendance')";await connection.execute(`UPDATE reports SET file_path=NULL WHERE generated_by=?${updateScope}`,[target.id])}
     return paths
   })
   for(const reportPath of expiredReportPaths){try{await fs.rm(filePath(reportPath),{force:true})}catch(error){console.warn(JSON.stringify({event:'report_scope_cleanup_failed',user_id:target.id,message:error.message}))}}
-  res.json({message:assignmentChanged?'Teacher account and pupil access updated. Previous progress and attendance exports expired; regenerate them for the updated pupil scope.':'User account updated.'})
+  if(roleChanged)invalidateUserAuth(target.id)
+  res.json({message:roleChanged?`${role==='teacher'?'Teacher':'Reading Coordinator'} role assigned. Activate the account when it is ready.`:assignmentChanged?'Teacher account and pupil access updated. Previous progress and attendance exports expired; regenerate them for the updated pupil scope.':'User account updated.'})
 })
+
 app.post('/api/users/:id/:action', async (req,res)=>{
-  requireRole(req,['coordinator'])
+  requireRole(req,['principal'])
   assert(['toggle','reset-password'].includes(req.params.action),404,'Not found.')
   const target=await one("SELECT id,status FROM users WHERE id=? AND role IN ('teacher','coordinator') AND id<>?",[req.params.id,req.user.id]);assert(target,404,'User account not found.')
   if(req.params.action==='toggle'){const status=target.status==='active'?'inactive':'active';await query('UPDATE users SET status=? WHERE id=?',[status,target.id]);invalidateUserAuth(target.id);res.json({message:`User account ${status}.`})}
@@ -739,12 +747,12 @@ app.get('/api/teachers', async (req,res)=>{
   res.json({teachers:list?.data||list,principal,...(list?.pagination?{pagination:list.pagination}:{})})
 })
 app.get('/api/teachers/principal', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id,full_name,email,status,joined_date FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');res.json({data:p})})
-app.put('/api/teachers/principal', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');await query('UPDATE users SET full_name=?,email=? WHERE id=?',[req.body.full_name,req.body.email,p.id]);res.json({message:'Principal account updated.'})})
-app.post('/api/teachers/principal/:action', async (req,res)=>{requireRole(req,adminRoles);const p=await one("SELECT id,status FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');if(req.params.action==='toggle'){await query('UPDATE users SET status=? WHERE id=?',[p.status==='active'?'inactive':'active',p.id]);invalidateUserAuth(p.id)}else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),p.id]);else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Principal account reset. Temporary password: password':'Principal account status updated.'})})
+app.put('/api/teachers/principal', async (req,res)=>{requireRole(req,['principal']);const p=await one("SELECT id FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');await query('UPDATE users SET full_name=?,email=? WHERE id=?',[req.body.full_name,req.body.email,p.id]);res.json({message:'Principal account updated.'})})
+app.post('/api/teachers/principal/:action', async (req,res)=>{requireRole(req,['principal']);const p=await one("SELECT id,status FROM users WHERE role='principal' ORDER BY id LIMIT 1");assert(p,404,'Principal account not found.');if(req.params.action==='toggle'){await query('UPDATE users SET status=? WHERE id=?',[p.status==='active'?'inactive':'active',p.id]);invalidateUserAuth(p.id)}else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),p.id]);else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Principal account reset. Temporary password: password':'Principal account status updated.'})})
 app.get('/api/teachers/:id/profile', async (req,res)=>{assert(adminRoles.includes(req.user.role)||Number(req.user.id)===Number(req.params.id),403);const teacher=await one("SELECT id,full_name,email,section,grade_level,status,joined_date,profile_image FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');const [students,assessments,sessions]=await Promise.all([query('SELECT * FROM students WHERE teacher_id=? ORDER BY full_name',[req.params.id]),query('SELECT a.*,s.full_name FROM assessments a JOIN students s ON s.id=a.student_id WHERE s.teacher_id=? ORDER BY a.assessment_date DESC LIMIT 20',[req.params.id]),query('SELECT r.* FROM remedial_sessions r JOIN students s ON s.id=r.student_id WHERE s.teacher_id=? ORDER BY r.session_date DESC LIMIT 20',[req.params.id])]);res.json({teacher,students,assessments,sessions})})
-app.post('/api/teachers', async (req,res)=>{requireRole(req,adminRoles);const b=req.body;assert(b.full_name&&b.email,422,'Name and email are required.');assert(!await one('SELECT id FROM users WHERE email=?',[b.email]),422,'Email is already in use.');const id=await insert("INSERT INTO users (full_name,email,section,grade_level,password,role,status,joined_date) VALUES (?,?,?,? ,?,'teacher','active',CURDATE())",[b.full_name,b.email,b.section||null,b.grade_level||null,await bcrypt.hash('password',10)]);res.status(201).json({message:'Teacher account created successfully!',id,temporary_password:'password'})})
-app.put('/api/teachers/:id', async (req,res)=>{requireRole(req,adminRoles);const b=req.body;const teacher=await one("SELECT id FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');assert(!await one('SELECT id FROM users WHERE email=? AND id<>?',[b.email,req.params.id]),422,'Email is already in use.');await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=? WHERE id=?',[b.full_name,b.email,b.section||null,b.grade_level||null,req.params.id]);res.json({message:'Teacher profile updated.'})})
-app.post('/api/teachers/:id/:action', async (req,res)=>{requireRole(req,adminRoles);const teacher=await one("SELECT id,status FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');if(req.params.action==='toggle'){await query('UPDATE users SET status=? WHERE id=?',[teacher.status==='active'?'inactive':'active',teacher.id]);invalidateUserAuth(teacher.id)}else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),teacher.id]);else if(req.params.action==='delete'){await query('DELETE FROM users WHERE id=?',[teacher.id]);invalidateUserAuth(teacher.id)}else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Teacher account reset. Temporary password: password':'Teacher account updated.'})})
+app.post('/api/teachers', async (req,res)=>{requireRole(req,['principal']);const b=req.body;assert(b.full_name&&b.email,422,'Name and email are required.');assert(!await one('SELECT id FROM users WHERE email=?',[b.email]),422,'Email is already in use.');const id=await insert("INSERT INTO users (full_name,email,section,grade_level,password,role,status,joined_date) VALUES (?,?,?,? ,?,'teacher','active',CURDATE())",[b.full_name,b.email,b.section||null,b.grade_level||null,await bcrypt.hash('password',10)]);res.status(201).json({message:'Teacher account created successfully!',id,temporary_password:'password'})})
+app.put('/api/teachers/:id', async (req,res)=>{requireRole(req,['principal']);const b=req.body;const teacher=await one("SELECT id FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');assert(!await one('SELECT id FROM users WHERE email=? AND id<>?',[b.email,req.params.id]),422,'Email is already in use.');await query('UPDATE users SET full_name=?,email=?,section=?,grade_level=? WHERE id=?',[b.full_name,b.email,b.section||null,b.grade_level||null,req.params.id]);res.json({message:'Teacher profile updated.'})})
+app.post('/api/teachers/:id/:action', async (req,res)=>{requireRole(req,['principal']);const teacher=await one("SELECT id,status FROM users WHERE id=? AND role='teacher'",[req.params.id]);assert(teacher,404,'Teacher not found.');if(req.params.action==='toggle'){await query('UPDATE users SET status=? WHERE id=?',[teacher.status==='active'?'inactive':'active',teacher.id]);invalidateUserAuth(teacher.id)}else if(req.params.action==='reset-password')await query('UPDATE users SET password=? WHERE id=?',[await bcrypt.hash('password',10),teacher.id]);else if(req.params.action==='delete'){await query('DELETE FROM users WHERE id=?',[teacher.id]);invalidateUserAuth(teacher.id)}else fail(404,'Not found.');res.json({message:req.params.action==='reset-password'?'Teacher account reset. Temporary password: password':'Teacher account updated.'})})
 
 app.get('/api/settings', async (_req,res)=>{const rows=await query('SELECT setting_key,setting_value FROM app_settings');res.json({settings:Object.fromEntries(rows.map(r=>[r.setting_key,r.setting_value]))})})
 app.put('/api/settings', async (req,res)=>{requireRole(req,adminRoles);const keys=['school_name','school_id','school_address','school_contact','school_email','school_logo','school_year','program_name','grade_levels_covered','assessment_information'];await transaction(async c=>{for(const key of keys)await c.execute('INSERT INTO app_settings (setting_key,setting_value,updated_by,updated_at) VALUES (?,?,?,NOW()) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value),updated_by=VALUES(updated_by),updated_at=NOW()',[key,req.body[key]||'',req.user.id])});res.json({message:'School and reading program settings saved.'})})
