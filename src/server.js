@@ -296,12 +296,13 @@ app.use('/api', async (req, res, next) => {
     req.user = user
     req.apiTokenId = user.api_token_id
     const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase())
-    const principalSelfService = ['/auth/logout', '/profile', '/profile/password', '/profile/image'].includes(req.path)
-    const reportGeneration = req.path === '/reports' && req.method === 'POST'
+    const apiPath = String(req.originalUrl || req.path).split('?')[0].replace(/^\/api(?=\/|$)/, '') || '/'
+    const principalSelfService = ['/auth/logout', '/profile', '/profile/password', '/profile/image'].includes(apiPath)
+    const reportGeneration = apiPath === '/reports' && req.method === 'POST'
     const userManagementWrite =
-      (req.path === '/users' && req.method === 'POST') ||
-      (/^\/users\/\d+$/.test(req.path) && req.method === 'PUT') ||
-      (/^\/users\/\d+\/(toggle|reset-password)$/.test(req.path) && req.method === 'POST')
+      (apiPath === '/users' && req.method === 'POST') ||
+      (/^\/users\/\d+\/?$/.test(apiPath) && req.method === 'PUT') ||
+      (/^\/users\/\d+\/(toggle|reset-password)\/?$/.test(apiPath) && req.method === 'POST')
     if (user.role === 'principal' && isWrite && !principalSelfService && !reportGeneration && !userManagementWrite) return fail(403, 'Principal accounts have view-only access.')
     if (isWrite && req.path !== '/auth/logout' && req.path !== '/notifications/read') {
       const message = `${user.full_name} ${activityLabel(req)}`
