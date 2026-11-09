@@ -331,7 +331,8 @@ app.get('/api/students', async (req, res) => {
   let where = ' WHERE 1=1'
   if (req.user.role === 'teacher') { where += ' AND s.teacher_id = ?'; params.push(req.user.id) }
   if (req.query.section && req.query.section !== 'All Sections') { where += ' AND s.section = ?'; params.push(req.query.section) }
-  if (req.query.reading_level) { where += ' AND s.reading_profile = ?'; params.push(req.query.reading_level) }
+  if (req.query.reading_level === 'other') where += " AND (s.reading_profile IS NULL OR s.reading_profile NOT IN ('Independent','Instructional','Frustration'))"
+  else if (req.query.reading_level) { where += ' AND s.reading_profile = ?'; params.push(req.query.reading_level) }
   if (req.query.search) { const term = searchLike(req.query.search); where += ' AND (s.full_name LIKE ? OR s.lrn LIKE ?)'; params.push(term, term) }
   const sql = `SELECT s.id,s.lrn,s.full_name,s.section,s.grade_level,s.teacher_id,s.date_enrolled,s.profile_image,s.parent_guardian,s.contact_number,s.reading_profile,s.score,t.full_name AS teacher_name,(SELECT a.assessment_date FROM assessments a WHERE a.student_id=s.id ORDER BY a.assessment_date DESC,a.id DESC LIMIT 1) AS latest_assessment FROM students s LEFT JOIN users t ON t.id=s.teacher_id${where} ORDER BY s.grade_level,s.section,s.full_name`
   const isPaginated = 'page' in req.query || 'per_page' in req.query
@@ -413,14 +414,14 @@ app.get('/api/dashboard', async (req, res) => {
   const scope = teacher ? ' WHERE teacher_id=?' : ''
   const scopeParams = teacher ? [req.user.id] : []
   const studentScope = teacher ? 's.teacher_id=? AND ' : ''
-  const metricsSql = `SELECT sm.students,sm.independent,sm.instructional,sm.frustration,
+  const metricsSql = `SELECT sm.students,sm.independent,sm.instructional,sm.frustration,sm.other,
     (SELECT COUNT(*) FROM assessments a JOIN students s ON s.id=a.student_id WHERE ${studentScope}1=1) AS assessments,
     (SELECT COUNT(*) FROM endorsements e JOIN students s ON s.id=e.student_id WHERE e.status='Pending'${teacher ? ' AND s.teacher_id=?' : ''}) AS pending_endorsements,
     (SELECT COUNT(*) FROM remedial_sessions rs JOIN students s ON s.id=rs.student_id WHERE ${studentScope}1=1) AS remedial_sessions,
     (SELECT COUNT(DISTINCT s.id) FROM students s JOIN remedial_sessions rs ON rs.student_id=s.id WHERE ${studentScope}rs.status IN ('Scheduled','In Progress')) AS remedial_pupils,
     ${teacher ? '0' : "(SELECT COUNT(*) FROM users WHERE role='teacher' AND status='active')"} AS teachers,
     attendance.present_attendance,attendance.absent_attendance
-    FROM (SELECT COUNT(*) students,COALESCE(SUM(reading_profile='Independent'),0) independent,COALESCE(SUM(reading_profile='Instructional'),0) instructional,COALESCE(SUM(reading_profile='Frustration'),0) frustration FROM students${scope}) sm
+    FROM (SELECT COUNT(*) students,COALESCE(SUM(reading_profile='Independent'),0) independent,COALESCE(SUM(reading_profile='Instructional'),0) instructional,COALESCE(SUM(reading_profile='Frustration'),0) frustration,COALESCE(SUM(reading_profile IS NULL OR reading_profile NOT IN ('Independent','Instructional','Frustration')),0) other FROM students${scope}) sm
     CROSS JOIN (SELECT COALESCE(SUM(ra.status='Present'),0) present_attendance,COALESCE(SUM(ra.status='Absent'),0) absent_attendance FROM remedial_attendance ra JOIN students attendance_student ON attendance_student.id=ra.student_id${teacher ? ' WHERE attendance_student.teacher_id=?' : ''}) attendance`
   const metricsParams = [
     ...scopeParams,
@@ -432,7 +433,7 @@ app.get('/api/dashboard', async (req, res) => {
   ]
   const [metrics, grades, recentAssessments, support, progress, upcoming, materials] = await Promise.all([
     one(metricsSql, metricsParams),
-    query(`SELECT grade_level,SUM(reading_profile='Independent') independent,SUM(reading_profile='Instructional') instructional,SUM(reading_profile='Frustration') frustration FROM students${scope} GROUP BY grade_level ORDER BY grade_level`, scopeParams),
+    query(`SELECT grade_level,SUM(reading_profile='Independent') independent,SUM(reading_profile='Instructional') instructional,SUM(reading_profile='Frustration') frustration,SUM(reading_profile IS NULL OR reading_profile NOT IN ('Independent','Instructional','Frustration')) other FROM students${scope} GROUP BY grade_level ORDER BY grade_level`, scopeParams),
     query(`SELECT a.id,s.full_name,s.grade_level,a.tool,a.total_score,a.profile,a.assessment_date FROM assessments a JOIN students s ON s.id=a.student_id WHERE ${studentScope}1=1 ORDER BY a.assessment_date DESC,a.id DESC LIMIT 5`, scopeParams),
     query(`SELECT id,full_name,grade_level,section,reading_profile,score FROM students${scope}${teacher ? ' AND' : ' WHERE'} reading_profile IN ('Frustration','Low Emerging Reader') ORDER BY full_name LIMIT 5`, scopeParams),
     query(`SELECT pu.id,pu.student_id,pu.previous_profile,pu.current_profile,pu.trend,pu.update_date,s.full_name,s.grade_level,s.section FROM progress_updates pu JOIN students s ON s.id=pu.student_id WHERE ${studentScope}1=1 ORDER BY pu.update_date DESC LIMIT 6`, scopeParams),
@@ -440,7 +441,7 @@ app.get('/api/dashboard', async (req, res) => {
     query(`SELECT lm.title,lm.material_type,md.given_to,md.grade_level,md.date_given,u.full_name given_by_name FROM material_distribution md JOIN learning_materials lm ON lm.id=md.material_id LEFT JOIN users u ON u.id=md.given_by LEFT JOIN students s ON s.full_name=md.given_to WHERE ${teacher ? 's.teacher_id=? AND ' : ''}1=1 ORDER BY md.date_given DESC LIMIT 6`, teacher ? [req.user.id] : []),
   ])
   const present = Number(metrics.present_attendance || 0), absent = Number(metrics.absent_attendance || 0)
-  res.json({ role: req.user.role, metrics: { students: Number(metrics.students), teachers: Number(metrics.teachers), assessments: Number(metrics.assessments), pending_endorsements: Number(metrics.pending_endorsements), remedial_sessions: Number(metrics.remedial_sessions), independent: Number(metrics.independent), instructional: Number(metrics.instructional), frustration: Number(metrics.frustration), remedial_pupils: Number(metrics.remedial_pupils), present_attendance: present, absent_attendance: absent, attendance_rate: present + absent ? Math.round(present / (present + absent) * 100) : 0 }, recent_assessments: recentAssessments, students_needing_support: support, intervention_pupils: support.filter((s) => s.reading_profile === 'Frustration'), student_overview: [], level_distribution: { independent: Number(metrics.independent), instructional: Number(metrics.instructional), frustration: Number(metrics.frustration) }, grade_distribution: grades, recent_progress: progress, upcoming_sessions: upcoming, material_history: materials })
+  res.json({ role: req.user.role, metrics: { students: Number(metrics.students), teachers: Number(metrics.teachers), assessments: Number(metrics.assessments), pending_endorsements: Number(metrics.pending_endorsements), remedial_sessions: Number(metrics.remedial_sessions), independent: Number(metrics.independent), instructional: Number(metrics.instructional), frustration: Number(metrics.frustration), other: Number(metrics.other), remedial_pupils: Number(metrics.remedial_pupils), present_attendance: present, absent_attendance: absent, attendance_rate: present + absent ? Math.round(present / (present + absent) * 100) : 0 }, recent_assessments: recentAssessments, students_needing_support: support, intervention_pupils: support.filter((s) => s.reading_profile === 'Frustration'), student_overview: [], level_distribution: { independent: Number(metrics.independent), instructional: Number(metrics.instructional), frustration: Number(metrics.frustration), other: Number(metrics.other) }, grade_distribution: grades, recent_progress: progress, upcoming_sessions: upcoming, material_history: materials })
 })
 
 app.get('/api/assessments', async (req, res) => {
