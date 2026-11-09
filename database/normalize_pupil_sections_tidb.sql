@@ -1,10 +1,10 @@
-﻿-- Normalize pupil sections to Alvarez, Aguinaldo, and Calderon.
--- Run the entire script in one TiDB SQL Editor session.
--- Existing pupils already in one of the three sections are preserved.
--- Pupils assigned to the uniquely named Ms. Cruz account are moved to Alvarez.
--- Other pupils with missing/outdated sections are split by pupil ID order;
--- the two resulting groups differ by at most one pupil.
--- If there is not exactly one teacher named "Ms. Cruz", the update is a no-op.
+-- Normalize pupil sections to Alvarez, Aguinaldo, and Calderon.
+-- Run the statements in order in the Subaybay TiDB schema.
+-- First confirm the preflight query returns exactly one Ms. Cruz account.
+-- Pupils already in one of the three target sections are preserved.
+-- Pupils assigned to Ms. Cruz are moved to Alvarez. All other pupils with
+-- missing/outdated sections are split by pupil ID order between Aguinaldo
+-- and Calderon; the resulting groups differ by at most one pupil.
 
 SELECT COUNT(*) AS ms_cruz_matches
 FROM users
@@ -15,54 +15,56 @@ FROM students
 GROUP BY section
 ORDER BY section;
 
-SET @ms_cruz_match_count := (
-    SELECT COUNT(*)
+-- Update the uniquely matching Ms. Cruz teacher account, if exactly one exists.
+UPDATE users AS target_user
+JOIN (
+    SELECT MIN(id) AS id, COUNT(*) AS match_count
     FROM users
     WHERE role = 'teacher' AND TRIM(full_name) = 'Ms. Cruz'
-);
-SET @ms_cruz_id := (
-    SELECT MIN(id)
+) AS ms_cruz ON ms_cruz.id = target_user.id AND ms_cruz.match_count = 1
+SET target_user.section = 'Alvarez';
+
+-- Move pupils assigned to Ms. Cruz to Alvarez.
+UPDATE students AS target_pupil
+JOIN (
+    SELECT MIN(id) AS id, COUNT(*) AS match_count
     FROM users
     WHERE role = 'teacher' AND TRIM(full_name) = 'Ms. Cruz'
-    HAVING COUNT(*) = 1
-);
+) AS ms_cruz ON ms_cruz.match_count = 1 AND target_pupil.teacher_id = ms_cruz.id
+SET target_pupil.section = 'Alvarez';
 
-DROP TEMPORARY TABLE IF EXISTS tmp_pupil_section_assignment;
-CREATE TEMPORARY TABLE tmp_pupil_section_assignment (
-    student_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-    section_name VARCHAR(32) NOT NULL
-);
+-- Split every other pupil whose section is not one of the three approved names.
+UPDATE students AS target_pupil
+JOIN (
+    SELECT ranked_pupils.id,
+           CASE
+               WHEN MOD(ranked_pupils.row_num, 2) = 1 THEN 'Aguinaldo'
+               ELSE 'Calderon'
+           END AS section_name
+    FROM (
+        SELECT eligible_pupils.id,
+               ROW_NUMBER() OVER (ORDER BY eligible_pupils.id) AS row_num
+        FROM (
+            SELECT pupil.id
+            FROM students AS pupil
+            CROSS JOIN (
+                SELECT MIN(id) AS id, COUNT(*) AS match_count
+                FROM users
+                WHERE role = 'teacher' AND TRIM(full_name) = 'Ms. Cruz'
+            ) AS ms_cruz
+            WHERE ms_cruz.match_count = 1
+              AND (pupil.teacher_id IS NULL OR pupil.teacher_id <> ms_cruz.id)
+              AND (
+                  pupil.section IS NULL
+                  OR UPPER(TRIM(pupil.section)) NOT IN ('ALVAREZ', 'AGUINALDO', 'CALDERON')
+              )
+        ) AS eligible_pupils
+    ) AS ranked_pupils
+) AS assignment ON assignment.id = target_pupil.id
+SET target_pupil.section = assignment.section_name;
 
-START TRANSACTION;
-
-UPDATE users
-SET section = 'Alvarez'
-WHERE id = @ms_cruz_id AND @ms_cruz_match_count = 1;
-
-UPDATE students
-SET section = 'Alvarez'
-WHERE teacher_id = @ms_cruz_id AND @ms_cruz_match_count = 1;
-
-INSERT INTO tmp_pupil_section_assignment (student_id, section_name)
-SELECT ordered_pupils.id,
-       CASE WHEN MOD(ordered_pupils.row_num, 2) = 1 THEN 'Aguinaldo' ELSE 'Calderon' END
-FROM (
-    SELECT s.id, ROW_NUMBER() OVER (ORDER BY s.id) AS row_num
-    FROM students s
-    WHERE @ms_cruz_match_count = 1
-      AND (s.teacher_id IS NULL OR s.teacher_id <> @ms_cruz_id)
-      AND (s.section IS NULL OR UPPER(TRIM(s.section)) NOT IN ('ALVAREZ', 'AGUINALDO', 'CALDERON'))
-) AS ordered_pupils;
-
-UPDATE students s
-JOIN tmp_pupil_section_assignment assignment ON assignment.student_id = s.id
-SET s.section = assignment.section_name;
-
-COMMIT;
-
+-- Confirm the resulting counts.
 SELECT section, COUNT(*) AS pupil_count
 FROM students
 GROUP BY section
 ORDER BY section;
-
-DROP TEMPORARY TABLE tmp_pupil_section_assignment;
