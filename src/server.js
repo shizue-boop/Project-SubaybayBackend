@@ -810,7 +810,7 @@ app.use((error, req, res, _next) => {
   const routePath=req.path.startsWith('/api/')?req.path.slice(4):req.path
   if (String(error.code || '').startsWith('LIMIT_')) return res.status(413).json({message:'The uploaded file is too large.'})
   if (error.code==='ER_DUP_ENTRY') return res.status(422).json({message:'A record with the same unique value already exists.'})
-  if (error.code==='ER_NO_SUCH_TABLE' && (routePath==='/profile/image' || /^\/users\/\d+\/image$/.test(routePath))) return res.status(503).json({message:'Profile photo storage is not set up. Apply backend/database/profile_images_tidb.sql to the TiDB database.'})
+  if (error.code==='ER_NO_SUCH_TABLE' && (routePath==='/profile/image' || routePath==='/settings/logo' || /^\/users\/\d+\/image$/.test(routePath))) return res.status(503).json({message:'Image storage is not set up. Apply backend/database/profile_images_tidb.sql to the TiDB database.'})
   if (error.code==='ER_NO_SUCH_TABLE'||error.code==='ER_BAD_FIELD_ERROR') {
     console.error(JSON.stringify({event:'api_schema_error',method:req.method,path:req.path,code:error.code,message:error.message}))
     return res.status(503).json({message:'Database schema is missing or outdated.',detail:process.env.APP_DEBUG==='true'?error.message:undefined})
