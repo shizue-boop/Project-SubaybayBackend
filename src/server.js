@@ -281,7 +281,7 @@ app.post('/api/auth/register', async (req, res) => {
 })
 
 app.use('/api', async (req, res, next) => {
-  if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/register' || req.path === '/auth/registration-status') return next()
+  if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/register' || req.path === '/auth/registration-status' || (req.path === '/public/school-logo' && req.method === 'GET')) return next()
   try {
     const header = String(req.headers.authorization || '')
     const match = header.match(/^Bearer\s+(\d+)\|([a-f0-9]+)$/i)
@@ -766,6 +766,7 @@ app.post('/api/teachers/:id/:action', async (req,res)=>{requireRole(req,['princi
 app.get('/api/settings', async (_req,res)=>{const rows=await query('SELECT setting_key,setting_value FROM app_settings');res.json({settings:Object.fromEntries(rows.map(r=>[r.setting_key,r.setting_value]))})})
 app.put('/api/settings', async (req,res)=>{requireRole(req,adminRoles);const keys=['school_name','school_id','school_address','school_contact','school_email','school_year','program_name','grade_levels_covered','assessment_information'];await transaction(async c=>{for(const key of keys)await c.execute('INSERT INTO app_settings (setting_key,setting_value,updated_by,updated_at) VALUES (?,?,?,NOW()) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value),updated_by=VALUES(updated_by),updated_at=NOW()',[key,req.body[key]||'',req.user.id])});res.json({message:'School and reading program settings saved.'})})
 app.get('/api/settings/logo', async (_req,res)=>{const setting=await one("SELECT setting_value FROM app_settings WHERE setting_key='school_logo'");if(!setting?.setting_value)return res.status(204).end();await sendProfileImage(res,'school',1,setting.setting_value)})
+app.get('/api/public/school-logo', async (_req,res)=>{const setting=await one("SELECT setting_value FROM app_settings WHERE setting_key='school_logo'");if(!setting?.setting_value)return res.status(204).end();await sendProfileImage(res,'school',1,setting.setting_value)})
 app.post('/api/settings/logo', imageUpload.single('school_logo'), async (req,res)=>{requireRole(req,adminRoles);assert(req.file&&/^image\/(jpeg|png|gif|webp)$/.test(req.file.mimetype),422,'Upload a JPG, PNG, GIF, or WebP image.');const imagePath=await saveProfileImage(req.file,'school',1);await query("INSERT INTO app_settings (setting_key,setting_value,updated_by,updated_at) VALUES ('school_logo',?,?,NOW()) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value),updated_by=VALUES(updated_by),updated_at=NOW()",[imagePath,req.user.id]);res.json({message:'School logo updated successfully.'})})
 app.delete('/api/settings/logo', async (req,res)=>{requireRole(req,adminRoles);await ensureProfileImagesTable();await transaction(async connection=>{await connection.execute('DELETE FROM profile_images WHERE owner_type=? AND owner_id=?',['school',1]);await connection.execute("INSERT INTO app_settings (setting_key,setting_value,updated_by,updated_at) VALUES ('school_logo','',?,NOW()) ON DUPLICATE KEY UPDATE setting_value='',updated_by=VALUES(updated_by),updated_at=NOW()",[req.user.id])});res.json({message:'School logo removed.'})})
 
@@ -810,7 +811,7 @@ app.use((error, req, res, _next) => {
   const routePath=req.path.startsWith('/api/')?req.path.slice(4):req.path
   if (String(error.code || '').startsWith('LIMIT_')) return res.status(413).json({message:'The uploaded file is too large.'})
   if (error.code==='ER_DUP_ENTRY') return res.status(422).json({message:'A record with the same unique value already exists.'})
-  if (error.code==='ER_NO_SUCH_TABLE' && (routePath==='/profile/image' || routePath==='/settings/logo' || /^\/users\/\d+\/image$/.test(routePath))) return res.status(503).json({message:'Image storage is not set up. Apply backend/database/profile_images_tidb.sql to the TiDB database.'})
+  if (error.code==='ER_NO_SUCH_TABLE' && (routePath==='/profile/image' || routePath==='/settings/logo' || routePath==='/public/school-logo' || /^\/users\/\d+\/image$/.test(routePath))) return res.status(503).json({message:'Image storage is not set up. Apply backend/database/profile_images_tidb.sql to the TiDB database.'})
   if (error.code==='ER_NO_SUCH_TABLE'||error.code==='ER_BAD_FIELD_ERROR') {
     console.error(JSON.stringify({event:'api_schema_error',method:req.method,path:req.path,code:error.code,message:error.message}))
     return res.status(503).json({message:'Database schema is missing or outdated.',detail:process.env.APP_DEBUG==='true'?error.message:undefined})
